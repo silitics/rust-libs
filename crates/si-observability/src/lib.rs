@@ -96,7 +96,8 @@
 //! At runtime, OTLP export is enabled and configured via the `APP_LOG_OTLP` environment
 //! variable using [`EnvFilter`] directives. Additional environment variables, e.g., for
 //! the configuration of OTLP endpoints and headers, follow the [OpenTelemetry standard].
-//! At the moment, trace export is limited to the `http/protobuf` protocol.
+//! At the moment, trace export is limited to the `http/protobuf` protocol. HTTPS
+//! endpoints are verified against the operating system's trust store.
 //!
 //! You can use the variable `OTEL_RESOURCE_ATTRIBUTES` to set OpenTelemetry resource
 //! attributes. For instance:

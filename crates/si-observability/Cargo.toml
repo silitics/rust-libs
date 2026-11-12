@@ -17,10 +17,10 @@ clap4 = { package = "clap", version = "4.5.37", optional = true, features = ["de
 
 # OTLP-related dependencies. HTTPS export trusts the operating system's trust store.
 opentelemetry = { version = "0.30", optional = true }
+opentelemetry-appender-tracing = { version = "0.30", optional = true, features = ["experimental_use_tracing_span_context"] }
 opentelemetry-otlp = { version = "0.30", features = ["metrics", "reqwest-rustls"], optional = true }
 opentelemetry-semantic-conventions = { version = "0.30", optional = true }
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"], optional = true }
-opentelemetry-appender-tracing = { version = "0.30", optional = true, features = ["experimental_use_tracing_span_context"] }
 tracing-opentelemetry = { version = "0.31", optional = true }
 
 [features]
@@ -29,27 +29,13 @@ full = ["clap4", "otlp"]
 clap4 = ["dep:clap4"]
 
 # Export logs and traces via OTLP.
-otlp = [
-    "otlp-traces",
-    "otlp-logs",
-]
+otlp = ["otlp-traces", "otlp-logs"]
 # Export logs via OTLP.
-otlp-logs = [
-    "__otlp",
-    "dep:opentelemetry-appender-tracing",
-]
+otlp-logs = ["__otlp", "dep:opentelemetry-appender-tracing"]
 # Export traces via OTLP.
-otlp-traces = [
-    "__otlp",
-    "dep:tracing-opentelemetry",
-]
+otlp-traces = ["__otlp", "dep:tracing-opentelemetry"]
 # Basic OTLP support.
-__otlp = [
-    "dep:opentelemetry",
-    "dep:opentelemetry-otlp",
-    "dep:opentelemetry_sdk",
-    "dep:opentelemetry-semantic-conventions",
-]
+__otlp = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:opentelemetry-semantic-conventions"]
 
 [[example]]
 name = "basic"

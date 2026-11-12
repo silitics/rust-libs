@@ -385,7 +385,7 @@ fn export_excludes_backtrace_by_default_includes_when_requested() {
         .export_with(ExportOptions::new().with_backtrace())
         .backtrace
         .expect("backtrace must be exported when requested");
-    assert!(!frames.is_empty());
+    assert_ne!(frames.len(), 0);
 }
 
 #[cfg(feature = "spantrace")]
@@ -400,7 +400,7 @@ fn export_excludes_spantrace_by_default_includes_when_requested() {
         .export_with(ExportOptions::new().with_spantrace())
         .spantrace
         .expect("spantrace must be exported when requested");
-    assert!(!spans.is_empty());
+    assert_ne!(spans.len(), 0);
 }
 
 #[cfg(feature = "serde")]
@@ -764,9 +764,10 @@ fn render_verbose_backtrace_skips_reportifys_own_frames() {
     let text = report.render(RenderOptions::new().verbose());
     // Every frame below this call, including this test function itself, lives inside the
     // `reportify` crate (its own test suite), so it is all skipped as reportify's own
-    // machinery: there is no "external caller" frame left to assert is still shown, unlike
-    // a real downstream consumer. What's left to check from in here is that skipping
-    // happened at all, and that the raw capture frame is never printed unskipped.
+    // machinery: there is no "external caller" frame left to assert is still shown,
+    // unlike a real downstream consumer. What's left to check from in here is that
+    // skipping happened at all, and that the raw capture frame is never printed
+    // unskipped.
     assert!(
         text.contains("skipped"),
         "reportify's own frames must be skipped, got:\n{text}"

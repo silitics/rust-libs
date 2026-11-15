@@ -15,12 +15,27 @@
 //! The parsed spelling is preserved for display. Build metadata is preserved
 //! but ignored for equality, hashing, ordering, and requirement matching.
 //!
-//! A [`VersionReq`] is a comma-separated conjunction of [`Comparator`]s that
-//! compare versions in this order, with one exception taken from PEP 440: an
-//! exclusive upper bound without a prerelease, such as `<4`, also excludes
-//! prereleases of its version, such as `4.0-rc.1`. A requirement like `>=3,<4`
-//! therefore matches `3.5-beta` but not `4.0-rc.1`. An upper bound with a
-//! prerelease, such as `<4-rc.2`, compares in the total order.
+//! A [`VersionReq`] is a comma-separated conjunction of [`Comparator`]s. A
+//! comparator's version without a prerelease names a _line_: all versions whose
+//! release components start with the comparator's release components, including
+//! their prereleases. The line `3` contains `3.0-rc.1`, `3`, and `3.5.1`, and the
+//! line `3.0` contains `3.0-rc.1` and `3.0.5`, but not `3.1`. Comparators refer
+//! to the start or the end of the line:
+//!
+//! - `>=3` matches every version from the start of the line `3`, including `3.0-rc.1`.
+//! - `<4` matches every version before the start of the line `4`, so it does not match
+//!   `4.0-rc.1`.
+//! - `>3` matches every version after the end of the line `3`, so it matches `4.0-rc.1`,
+//!   but not `3.1`. `>3.0` matches `3.1`.
+//! - `<=3` matches every version up to the end of the line `3`, such as `3.9`.
+//! - `3.*`, or `==3.*`, matches every version of the line `3`, and `!=3.*` matches every
+//!   other version.
+//! - `==3` and `!=3` compare exact versions, so `==3` matches `3.0`, but not `3.0-rc.1`
+//!   or `3.0.1`. A bare version, such as `3`, means `==3`.
+//!
+//! A requirement like `>=3,<4` therefore matches the whole line `3`, including
+//! its prereleases, but not `4.0-rc.1`. A comparator's version with a
+//! prerelease, such as `>=3-rc.2` or `<4-rc.2`, compares in the total order.
 //!
 //! Serde support (behind the `serde` feature, enabled by default) uses string
 //! representations for [`Version`], [`VersionReq`], [`Comparator`], and
@@ -343,36 +358,68 @@ impl<'de> Deserialize<'de> for VersionReq {
 }
 
 /// A single version comparator.
+///
+/// The crate root describes how comparators match versions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Comparator {
     /// Comparison operator.
     pub op: Operator,
     /// Version to compare against.
     pub version: Version,
+    /// Whether the comparator matches the whole line of its version, as in `3.*`.
+    ///
+    /// Only [`Operator::Equal`] and [`Operator::NotEqual`] support wildcards, and the
+    /// version must not have a prerelease.
+    pub wildcard: bool,
 }
 
 impl Comparator {
     /// Whether this comparator matches the given version.
-    ///
-    /// An exclusive upper bound without a prerelease, such as `<4`, also excludes
-    /// prereleases of its version, such as `4.0-rc.1`, as in PEP 440.
     #[must_use]
     pub fn matches(&self, version: &Version) -> bool {
+        if self.wildcard {
+            let in_line = self.compare_line(version) == Ordering::Equal;
+            return match self.op {
+                Operator::NotEqual => !in_line,
+                _ => in_line,
+            };
+        }
+        if self.version.is_prerelease() {
+            return match self.op {
+                Operator::Equal => version == &self.version,
+                Operator::NotEqual => version != &self.version,
+                Operator::Greater => version > &self.version,
+                Operator::GreaterEq => version >= &self.version,
+                Operator::Less => version < &self.version,
+                Operator::LessEq => version <= &self.version,
+            };
+        }
         match self.op {
             Operator::Equal => version == &self.version,
             Operator::NotEqual => version != &self.version,
-            Operator::Greater => version > &self.version,
-            Operator::GreaterEq => version >= &self.version,
-            Operator::Less => version < &self.version && !self.is_prerelease_of_bound(version),
-            Operator::LessEq => version <= &self.version,
+            Operator::GreaterEq => self.compare_start(version) != Ordering::Less,
+            Operator::Less => self.compare_start(version) == Ordering::Less,
+            Operator::Greater => self.compare_line(version) == Ordering::Greater,
+            Operator::LessEq => self.compare_line(version) != Ordering::Greater,
         }
     }
 
-    /// Whether `version` is a prerelease of this comparator's final release.
-    fn is_prerelease_of_bound(&self, version: &Version) -> bool {
-        !self.version.is_prerelease()
-            && version.is_prerelease()
-            && compare_release(&version.release, &self.version.release) == Ordering::Equal
+    /// Compare `version` with the start of this comparator's line.
+    ///
+    /// Prereleases count as their release, because the line starts with them.
+    fn compare_start(&self, version: &Version) -> Ordering {
+        compare_release(&version.release, &self.version.release)
+    }
+
+    /// Compare `version` with this comparator's line as a whole.
+    ///
+    /// Only as many release components count as the comparator's version spells.
+    fn compare_line(&self, version: &Version) -> Ordering {
+        let precision = self.version.release.len();
+        let prefix: Vec<u64> = (0..precision)
+            .map(|idx| version.release.get(idx).copied().unwrap_or(0))
+            .collect();
+        compare_release(&prefix, &self.version.release)
     }
 }
 
@@ -390,7 +437,11 @@ impl FromStr for Comparator {
 
 impl fmt::Display for Comparator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}{}", self.op, self.version)
+        write!(f, "{}{}", self.op, self.version)?;
+        if self.wildcard {
+            f.write_str(".*")?;
+        }
+        Ok(())
     }
 }
 
@@ -612,22 +663,40 @@ fn parse_comparator(input: &str, part: &str) -> Result<Comparator, ParseError> {
         ("=", Operator::Equal),
     ];
 
-    for (prefix, op) in OPERATORS {
-        if let Some(version) = part.strip_prefix(prefix) {
-            let version = version.trim();
-            if version.is_empty() {
-                return Err(ParseError::new(input, "comparator is missing a version"));
-            }
-            return Ok(Comparator {
-                op: *op,
-                version: version.parse()?,
-            });
-        }
+    let (op, version) = OPERATORS
+        .iter()
+        .find_map(|(prefix, op)| {
+            part.strip_prefix(prefix)
+                .map(|version| (*op, version.trim()))
+        })
+        .unwrap_or((Operator::Equal, part));
+    if version.is_empty() {
+        return Err(ParseError::new(input, "comparator is missing a version"));
     }
-
+    let Some(version) = version.strip_suffix(".*") else {
+        return Ok(Comparator {
+            op,
+            version: version.parse()?,
+            wildcard: false,
+        });
+    };
+    if !matches!(op, Operator::Equal | Operator::NotEqual) {
+        return Err(ParseError::new(
+            input,
+            "wildcards are only allowed with `==` and `!=`",
+        ));
+    }
+    let version: Version = version.parse()?;
+    if version.is_prerelease() || !version.build_metadata.is_empty() {
+        return Err(ParseError::new(
+            input,
+            "wildcard versions must not have a prerelease or build metadata",
+        ));
+    }
     Ok(Comparator {
-        op: Operator::Equal,
-        version: part.parse()?,
+        op,
+        version,
+        wildcard: true,
     })
 }
 
@@ -829,27 +898,89 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_upper_bound_excludes_prereleases_of_its_version() {
+    fn range_matches_whole_line_including_prereleases() {
         let requirement = req(">=3,<4");
-        assert!(!requirement.matches(&version("4.0-rc.1")));
-        assert!(!requirement.matches(&version("4-0")));
+        assert!(requirement.matches(&version("3.0-rc.1")));
         assert!(requirement.matches(&version("3.5-beta")));
         assert!(requirement.matches(&version("3.9")));
-        assert!(!req("<4.0.0").matches(&version("4-rc.1")));
+        assert!(!requirement.matches(&version("4.0-rc.1")));
+        assert!(!requirement.matches(&version("4-0")));
+        assert!(!requirement.matches(&version("2.9")));
     }
 
     #[test]
-    fn prerelease_upper_bound_keeps_total_order() {
+    fn lower_and_exclusive_upper_bounds_ignore_precision() {
+        for bound in ["3", "3.0", "3.0.0"] {
+            assert!(req(&format!(">={bound}")).matches(&version("3-rc.1")));
+            assert!(req(&format!(">={bound}")).matches(&version("3.0.0-rc.1")));
+            assert!(!req(&format!("<{bound}")).matches(&version("3.0-rc.1")));
+            assert!(req(&format!("<{bound}")).matches(&version("2.9")));
+        }
+    }
+
+    #[test]
+    fn greater_bound_starts_after_its_line() {
+        assert!(!req(">3").matches(&version("3.1")));
+        assert!(!req(">3").matches(&version("3")));
+        assert!(req(">3").matches(&version("4.0-rc.1")));
+        assert!(req(">3.0").matches(&version("3.1")));
+        assert!(!req(">3.0").matches(&version("3.0.5")));
+        assert!(req(">3.0.0").matches(&version("3.0.5")));
+        assert!(!req(">3.0").matches(&version("3")));
+    }
+
+    #[test]
+    fn inclusive_upper_bound_ends_with_its_line() {
+        assert!(req("<=3").matches(&version("3.9")));
+        assert!(req("<=3").matches(&version("3.0-rc.1")));
+        assert!(!req("<=3").matches(&version("4.0-rc.1")));
+        assert!(req("<=3.0").matches(&version("3.0.5")));
+        assert!(!req("<=3.0").matches(&version("3.1")));
+    }
+
+    #[test]
+    fn exact_comparators_ignore_lines() {
+        assert!(req("==3").matches(&version("3.0")));
+        assert!(!req("==3").matches(&version("3.0-rc.1")));
+        assert!(!req("==3").matches(&version("3.0.1")));
+        assert!(req("!=3").matches(&version("3.0.1")));
+        assert!(!req("!=3").matches(&version("3.0.0")));
+    }
+
+    #[test]
+    fn prerelease_bounds_keep_total_order() {
         assert!(req("<4-rc.2").matches(&version("4-rc.1")));
         assert!(!req("<4-rc.2").matches(&version("4-rc.2")));
         assert!(req("<1-alpha.1").matches(&version("1-alpha")));
+        assert!(!req(">=3-rc.2").matches(&version("3-rc.1")));
+        assert!(req(">=3-rc.2").matches(&version("3-rc.2")));
+        assert!(req(">3-rc.1").matches(&version("3-rc.2")));
+        assert!(!req("<=4-rc.1").matches(&version("4-rc.2")));
     }
 
     #[test]
-    fn inclusive_bounds_keep_total_order() {
-        assert!(req("<=4").matches(&version("4.0-rc.1")));
-        assert!(!req(">=4").matches(&version("4.0-rc.1")));
-        assert!(!req("==4").matches(&version("4.0-rc.1")));
+    fn wildcard_matches_line() {
+        let requirement = req("3.*");
+        assert!(requirement.matches(&version("3.0-rc.1")));
+        assert!(requirement.matches(&version("3")));
+        assert!(requirement.matches(&version("3.5.1")));
+        assert!(!requirement.matches(&version("4.0-rc.1")));
+        assert!(!requirement.matches(&version("2.9")));
+        assert!(req("==2024.6.*").matches(&version("2024.6.30")));
+        assert!(!req("2024.6.*").matches(&version("2024.7.1")));
+        assert!(req("3.0.*").matches(&version("3")));
+        assert!(!req("3.0.*").matches(&version("3.1")));
+        assert!(!req("!=3.*").matches(&version("3.2")));
+        assert!(req("!=3.*").matches(&version("4.0")));
+        assert!(req("3.*,>=3.2").matches(&version("3.2-rc.1")));
+        assert!(!req("3.*,>=3.2").matches(&version("3.1")));
+    }
+
+    #[test]
+    fn wildcard_round_trips_through_display() {
+        assert_eq!(req("3.*").to_string(), "==3.*");
+        assert_eq!(req("!=2024.6.*").to_string(), "!=2024.6.*");
+        assert_eq!(req(">=3,<4").to_string(), ">=3,<4");
     }
 
     #[test]
@@ -880,7 +1011,19 @@ mod tests {
 
     #[test]
     fn rejects_invalid_requirements() {
-        for input in ["", ">=", ">=1,", ">=1,,<2"] {
+        for input in [
+            "",
+            ">=",
+            ">=1,",
+            ">=1,,<2",
+            ">=3.*",
+            "<3.*",
+            "3.*-rc.1",
+            "3-rc.1.*",
+            "3.*+build",
+            "3.*.*",
+            ".*",
+        ] {
             assert!(VersionReq::parse(input).is_err(), "{input:?} should fail");
         }
     }

@@ -75,9 +75,9 @@
 //! 2. With equal release components, a prerelease precedes the release, so `1.0-rc.1`
 //!    precedes `1.0`.
 //! 3. Two prereleases compare identifier by identifier. Numeric identifiers compare
-//!    numerically and precede alphanumeric identifiers, which compare by ASCII order. If
-//!    one prerelease is a prefix of the other, the shorter one precedes, so `1.0-alpha`
-//!    precedes `1.0-alpha.1`.
+//!    numerically and precede alphanumeric identifiers, which compare lexicographically
+//!    by ASCII code. If one prerelease is a prefix of the other, the shorter one
+//!    precedes, so `1.0-alpha` precedes `1.0-alpha.1`.
 //! 4. Leading zeros of release components and numeric prerelease identifiers do not
 //!    affect precedence, so `05.1-rc.01` and `5.1-rc.1` have the same precedence. Build
 //!    metadata does not affect precedence either.

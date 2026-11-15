@@ -136,8 +136,7 @@
 //! and `~` are not supported, because they presume a scheme.
 //!
 //! Matching ignores how the matched version is spelled, so `==1` matches `1.0` and
-//! `1.0+build.7`. To check whether two versions have the same precedence, match one
-//! against an `==` requirement for the other.
+//! `1.0+build.7`.
 //!
 //! ## Lines
 //!

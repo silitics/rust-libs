@@ -231,7 +231,7 @@
 //!
 //! # Serde
 //!
-//! With the `serde` feature, enabled by default, [`Version`], [`VersionReq`],
+//! With the `serde` feature, [`Version`], [`VersionReq`],
 //! [`Comparator`], and [`Operator`] serialize as strings. Deserialization applies the
 //! same grammar as parsing, so invalid versions are rejected when the surrounding
 //! document is read:
@@ -259,6 +259,8 @@
 //! # #[cfg(not(feature = "serde"))]
 //! # fn main() {}
 //! ```
+
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -643,11 +645,11 @@ impl VersionReq {
     /// The comparators of this requirement, in the order they were written.
     ///
     /// ```
-    /// use anyver::{Operator, VersionReq};
+    /// use anyver::{Comparator, Operator, VersionReq};
     ///
     /// # fn main() -> Result<(), anyver::ParseError> {
     /// let requirement = VersionReq::parse(">=3,<4")?;
-    /// let operators: Vec<Operator> = requirement.comparators().iter().map(|c| c.op).collect();
+    /// let operators: Vec<Operator> = requirement.comparators().iter().map(Comparator::op).collect();
     /// assert_eq!(operators, [Operator::GreaterEq, Operator::Less]);
     /// # Ok(())
     /// # }
@@ -671,6 +673,41 @@ impl VersionReq {
         self.comparators
             .iter()
             .all(|comparator| comparator.matches(version))
+    }
+}
+
+/// Collects comparators into a requirement that matches if all of them match.
+///
+/// Collecting no comparators gives [`VersionReq::any`].
+///
+/// ```
+/// use anyver::{Comparator, Operator, Version, VersionReq};
+///
+/// # fn main() -> Result<(), anyver::ParseError> {
+/// let requirement: VersionReq = [
+///     Comparator::new(Operator::GreaterEq, Version::parse("2.20")?),
+///     Comparator::new(Operator::Less, Version::parse("3")?),
+/// ]
+/// .into_iter()
+/// .collect();
+/// assert_eq!(requirement.to_string(), ">=2.20,<3");
+/// # Ok(())
+/// # }
+/// ```
+impl FromIterator<Comparator> for VersionReq {
+    fn from_iter<I: IntoIterator<Item = Comparator>>(iter: I) -> Self {
+        Self {
+            comparators: iter.into_iter().collect(),
+        }
+    }
+}
+
+/// A requirement with a single comparator.
+impl From<Comparator> for VersionReq {
+    fn from(comparator: Comparator) -> Self {
+        Self {
+            comparators: vec![comparator],
+        }
     }
 }
 
@@ -743,7 +780,8 @@ impl<'de> Deserialize<'de> for VersionReq {
 /// One comparison of a [`VersionReq`], such as `>=3`, `<4-rc.2`, or `!=3.*`.
 ///
 /// The [crate documentation](crate#lines) defines how comparators match versions.
-/// The fields are public, so comparators can also be built directly.
+/// Comparators come from parsing or from [`Comparator::new`] and
+/// [`Comparator::wildcard`], which accept the same comparators as the parser.
 ///
 /// # Examples
 ///
@@ -751,48 +789,91 @@ impl<'de> Deserialize<'de> for VersionReq {
 /// use anyver::{Comparator, Operator, Version};
 ///
 /// # fn main() -> Result<(), anyver::ParseError> {
-/// let at_least_3 = Comparator {
-///     op: Operator::GreaterEq,
-///     version: Version::parse("3")?,
-///     wildcard: false,
-/// };
+/// let at_least_3 = Comparator::new(Operator::GreaterEq, Version::parse("3")?);
 /// assert!(at_least_3.matches(&Version::parse("3.0-rc.1")?));
 /// assert_eq!(at_least_3.to_string(), ">=3");
 ///
 /// let not_line_3: Comparator = "!=3.*".parse()?;
-/// assert!(not_line_3.wildcard);
+/// assert_eq!(not_line_3.op(), Operator::NotEqual);
+/// assert!(not_line_3.is_wildcard());
 /// assert!(!not_line_3.matches(&Version::parse("3.2")?));
 /// # Ok(())
 /// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Comparator {
-    /// The operator, such as `>=`.
-    pub op: Operator,
-    /// The version to compare against.
-    pub version: Version,
-    /// Whether the comparator refers to the whole line of its version, as in `3.*`.
-    ///
-    /// The parser only accepts wildcards with [`Operator::Equal`] and
-    /// [`Operator::NotEqual`] and a version without a prerelease or build metadata.
-    /// A directly built wildcard comparator matches by release components only,
-    /// ignoring the version's prerelease and build metadata, and with an operator
-    /// other than [`Operator::NotEqual`] it matches like [`Operator::Equal`]. Its
-    /// [`Display`](std::fmt::Display) output, and therefore its serialized form, can
-    /// only be parsed again if it follows the parser's rules.
-    pub wildcard: bool,
+    op: Operator,
+    version: Version,
+    wildcard: bool,
 }
 
 impl Comparator {
+    /// A comparator comparing with `version`, such as `>=3` or `<4-rc.2`.
+    #[must_use]
+    pub fn new(op: Operator, version: Version) -> Self {
+        Self {
+            op,
+            version,
+            wildcard: false,
+        }
+    }
+
+    /// A wildcard comparator for the line of `version`, such as `3.*` or `!=3.*`.
+    ///
+    /// Returns `None` unless `op` is [`Operator::Equal`] or [`Operator::NotEqual`]
+    /// and `version` has neither a prerelease nor build metadata.
+    ///
+    /// ```
+    /// use anyver::{Comparator, Operator, Version};
+    ///
+    /// # fn main() -> Result<(), anyver::ParseError> {
+    /// let line = Comparator::wildcard(Operator::Equal, Version::parse("2026.6")?);
+    /// assert_eq!(line.map(|c| c.to_string()).as_deref(), Some("==2026.6.*"));
+    /// assert!(Comparator::wildcard(Operator::Greater, Version::parse("3")?).is_none());
+    /// assert!(Comparator::wildcard(Operator::Equal, Version::parse("3-rc.1")?).is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn wildcard(op: Operator, version: Version) -> Option<Self> {
+        let valid = matches!(op, Operator::Equal | Operator::NotEqual)
+            && !version.is_prerelease()
+            && version.build_metadata().is_none();
+        valid.then_some(Self {
+            op,
+            version,
+            wildcard: true,
+        })
+    }
+
+    /// The operator, such as [`Operator::GreaterEq`] for `>=3`.
+    #[must_use]
+    pub fn op(&self) -> Operator {
+        self.op
+    }
+
+    /// The version to compare with, such as `3` for `>=3` or `3.*`.
+    #[must_use]
+    pub fn version(&self) -> &Version {
+        &self.version
+    }
+
+    /// Whether this comparator refers to the whole line of its version, as in `3.*`.
+    #[must_use]
+    pub fn is_wildcard(&self) -> bool {
+        self.wildcard
+    }
+
     /// Whether this comparator matches `version`, following the
     /// [line rules](crate#lines).
     #[must_use]
     pub fn matches(&self, version: &Version) -> bool {
         if self.wildcard {
             let in_line = self.compare_line(version) == Ordering::Equal;
-            return match self.op {
-                Operator::NotEqual => !in_line,
-                _ => in_line,
+            return if self.op == Operator::NotEqual {
+                !in_line
+            } else {
+                in_line
             };
         }
         if self.version.is_prerelease() {
@@ -826,11 +907,15 @@ impl Comparator {
     ///
     /// Only as many release components count as the comparator's version spells.
     fn compare_line(&self, version: &Version) -> Ordering {
-        let precision = self.version.release.len();
-        let prefix: Vec<u64> = (0..precision)
-            .map(|idx| version.release.get(idx).copied().unwrap_or(0))
-            .collect();
-        compare_release(&prefix, &self.version.release)
+        version
+            .release
+            .iter()
+            .copied()
+            .chain(std::iter::repeat(0))
+            .zip(&self.version.release)
+            .map(|(left, right)| left.cmp(right))
+            .find(|ordering| ordering.is_ne())
+            .unwrap_or(Ordering::Equal)
     }
 }
 
@@ -881,9 +966,12 @@ impl<'de> Deserialize<'de> for Comparator {
 ///
 /// Each variant describes how it matches for a comparator version without a
 /// prerelease. Without a wildcard and with a prerelease version, all operators
-/// compare by precedence. The
-/// [crate documentation](crate#lines) explains lines.
+/// compare by precedence. The [crate documentation](crate#lines) explains lines.
+///
+/// New operators may be added in minor releases, so matches on this type need a
+/// wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Operator {
     /// `==` or `=`: the same precedence, or, with a wildcard, within the line.
     Equal,
@@ -958,7 +1046,6 @@ impl<'de> Deserialize<'de> for Operator {
 /// [`Display`](std::fmt::Display) combines the input and the problem, as in
 /// `error parsing "1.x": release components must be numeric`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ParseError {
     input: String,
     message: String,
@@ -1097,11 +1184,7 @@ fn parse_comparator(input: &str, part: &str) -> Result<Comparator, ParseError> {
         return Err(ParseError::new(input, "comparator is missing a version"));
     }
     let Some(version) = version.strip_suffix(".*") else {
-        return Ok(Comparator {
-            op,
-            version: version.parse()?,
-            wildcard: false,
-        });
+        return Ok(Comparator::new(op, version.parse()?));
     };
     if !matches!(op, Operator::Equal | Operator::NotEqual) {
         return Err(ParseError::new(
@@ -1109,17 +1192,11 @@ fn parse_comparator(input: &str, part: &str) -> Result<Comparator, ParseError> {
             "wildcards are only allowed with `==` and `!=`",
         ));
     }
-    let version: Version = version.parse()?;
-    if version.is_prerelease() || version.build_metadata().is_some() {
-        return Err(ParseError::new(
+    Comparator::wildcard(op, version.parse()?).ok_or_else(|| {
+        ParseError::new(
             input,
             "wildcard versions must not have a prerelease or build metadata",
-        ));
-    }
-    Ok(Comparator {
-        op,
-        version,
-        wildcard: true,
+        )
     })
 }
 
@@ -1482,6 +1559,133 @@ mod tests {
             ".*",
         ] {
             assert!(VersionReq::parse(input).is_err(), "{input:?} should fail");
+        }
+    }
+
+    mod properties {
+        use std::cmp::Ordering;
+
+        use proptest::prelude::*;
+
+        use super::{req, version};
+
+        /// A release component or numeric identifier, sometimes with leading zeros.
+        fn number(max: u64) -> impl Strategy<Value = String> {
+            prop_oneof![
+                (0..max).prop_map(|n| n.to_string()),
+                (0..max).prop_map(|n| format!("0{n}")),
+            ]
+        }
+
+        /// A prerelease or build identifier, numeric or alphanumeric.
+        fn identifier() -> impl Strategy<Value = String> {
+            prop_oneof![number(12), "[0-9A-Za-z-]{0,2}[A-Za-z-][0-9A-Za-z-]{0,2}",]
+        }
+
+        /// Release components, kept small so that versions often share lines.
+        fn release() -> impl Strategy<Value = String> {
+            prop::collection::vec(number(3), 1..4).prop_map(|parts| parts.join("."))
+        }
+
+        /// Dot-separated identifiers.
+        fn identifiers() -> impl Strategy<Value = String> {
+            prop::collection::vec(identifier(), 1..4).prop_map(|parts| parts.join("."))
+        }
+
+        /// A version spelled with all parts of the grammar.
+        fn version_text() -> impl Strategy<Value = String> {
+            (
+                release(),
+                prop::option::of(identifiers()),
+                prop::option::of(identifiers()),
+            )
+                .prop_map(|(release, prerelease, build)| {
+                    let mut text = release;
+                    if let Some(prerelease) = prerelease {
+                        text = format!("{text}-{prerelease}");
+                    }
+                    if let Some(build) = build {
+                        text = format!("{text}+{build}");
+                    }
+                    text
+                })
+        }
+
+        /// A version that certainly has a prerelease.
+        fn prerelease_text() -> impl Strategy<Value = String> {
+            (release(), identifiers()).prop_map(|(release, pre)| format!("{release}-{pre}"))
+        }
+
+        proptest! {
+            /// Every version displays as it was spelled and parses back to itself.
+            #[test]
+            fn display_round_trips(text in version_text()) {
+                let parsed = version(&text);
+                prop_assert_eq!(parsed.to_string(), text);
+                prop_assert_eq!(version(&parsed.to_string()), parsed);
+            }
+
+            /// Parsing arbitrary input fails gracefully instead of panicking.
+            #[test]
+            fn parsing_arbitrary_input_does_not_panic(text in "\\PC{0,24}") {
+                let _ = super::Version::parse(&text);
+                let _ = super::VersionReq::parse(&text);
+            }
+
+            /// `Ord` is a total order consistent with `Eq` that refines precedence.
+            #[test]
+            fn ordering_is_consistent(
+                a in version_text(),
+                b in version_text(),
+                c in version_text(),
+            ) {
+                let (a, b, c) = (version(&a), version(&b), version(&c));
+                prop_assert_eq!(a.cmp(&b) == Ordering::Equal, a == b);
+                prop_assert_eq!(a.cmp(&b), b.cmp(&a).reverse());
+                if a <= b && b <= c {
+                    prop_assert!(a <= c);
+                }
+                let precedence = a.cmp_precedence(&b);
+                prop_assert_eq!(precedence, b.cmp_precedence(&a).reverse());
+                if precedence.is_ne() {
+                    prop_assert_eq!(a.cmp(&b), precedence);
+                }
+            }
+
+            /// Comparators on a line are complements and compose into the wildcard.
+            #[test]
+            fn line_comparators_are_consistent(bound in release(), candidate in version_text()) {
+                let candidate = version(&candidate);
+                let matches = |requirement: String| req(&requirement).matches(&candidate);
+                prop_assert_eq!(matches(format!(">={bound}")), !matches(format!("<{bound}")));
+                prop_assert_eq!(matches(format!(">{bound}")), !matches(format!("<={bound}")));
+                prop_assert_eq!(matches(format!("=={bound}")), !matches(format!("!={bound}")));
+                prop_assert_eq!(matches(format!("{bound}.*")), !matches(format!("!={bound}.*")));
+                prop_assert_eq!(
+                    matches(format!("{bound}.*")),
+                    matches(format!(">={bound}")) && matches(format!("<={bound}")),
+                );
+                let (greater, greater_eq) = (matches(format!(">{bound}")), matches(format!(">={bound}")));
+                let (less, less_eq) = (matches(format!("<{bound}")), matches(format!("<={bound}")));
+                prop_assert!(!greater || greater_eq);
+                prop_assert!(!less || less_eq);
+            }
+
+            /// Comparators whose version has a prerelease follow precedence.
+            #[test]
+            fn prerelease_comparators_follow_precedence(
+                bound in prerelease_text(),
+                candidate in version_text(),
+            ) {
+                let precedence = version(&candidate).cmp_precedence(&version(&bound));
+                let matches = |op: &str| req(&format!("{op}{bound}")).matches(&version(&candidate));
+                prop_assert_eq!(matches("=="), precedence.is_eq());
+                prop_assert_eq!(matches("!="), precedence.is_ne());
+                prop_assert_eq!(matches(">"), precedence.is_gt());
+                prop_assert_eq!(matches(">="), precedence.is_ge());
+                prop_assert_eq!(matches("<"), precedence.is_lt());
+                prop_assert_eq!(matches("<="), precedence.is_le());
+            }
         }
     }
 

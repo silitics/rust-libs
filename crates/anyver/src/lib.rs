@@ -1,51 +1,246 @@
-//! Scheme-agnostic version parsing and requirement matching.
+//! Version parsing and requirement matching for any versioning scheme.
 //!
-//! Versions use one ordered grammar covering `SemVer`, `CalVer`, serial versions, and
-//! date-plus-revision versions without assuming any particular scheme up front:
+//! Software in the wild is versioned in many ways. Libraries use [Semantic
+//! Versioning], operating system images often use [Calendar Versioning], firmware
+//! counts builds, and CI pipelines stamp timestamps. A system that combines
+//! components from many sources, such as an embedded Linux device running a system
+//! image, apps, and firmware, has to compare all of these versions without knowing
+//! in advance which scheme each component follows.
 //!
-//! - one or more dot-separated numeric release components, e.g. `5`, `5.2`, `5.2.0`,
-//!   `2026.6.25`;
-//! - an optional prerelease suffix introduced by `-`, e.g. `5.2.0-rc.1`;
-//! - optional build metadata introduced by `+`, e.g. `5.2.0+build.7`.
+//! `anyver` covers these schemes with one grammar and one order. It parses a version
+//! without assuming a scheme, compares versions numerically, and matches them against
+//! requirements such as `>=2.20,<3` or `2026.6.*`:
 //!
-//! Versions are ordered by _precedence_. Release components compare numerically
-//! with trailing zero components ignored, so `5`, `5.0`, and `5.0.0` have the
-//! same precedence. Prerelease versions precede the corresponding final release.
-//! Numeric release and prerelease identifiers may contain leading zeroes, which
-//! do not affect precedence. Build metadata does not affect precedence either.
-//! Requirement matching uses precedence, so `==5` matches `5.0` and `5+build.7`.
+//! ```
+//! use anyver::{Version, VersionReq};
 //!
-//! [`Version`] values keep their exact spelling. Equality and hashing compare
-//! the spelling, so `5`, `5.0`, and `5+build.7` are different values. [`Ord`]
-//! orders by precedence and breaks ties by spelling, so it is consistent with
-//! equality.
+//! # fn main() -> Result<(), anyver::ParseError> {
+//! let compose: Version = "2.27.0".parse()?;
+//! let requirement: VersionReq = ">=2.20,<3".parse()?;
+//! assert!(requirement.matches(&compose));
 //!
-//! A [`VersionReq`] is a comma-separated conjunction of [`Comparator`]s. A
-//! comparator's version without a prerelease names a _line_: all versions whose
-//! release components start with the comparator's release components, including
-//! their prereleases. The line `3` contains `3.0-rc.1`, `3`, and `3.5.1`, and the
-//! line `3.0` contains `3.0-rc.1` and `3.0.5`, but not `3.1`. Comparators refer
-//! to the start or the end of the line:
+//! // Calendar versions and serial numbers use the same grammar.
+//! let image: Version = "2026.06.25".parse()?;
+//! assert!(VersionReq::parse("2026.6.*")?.matches(&image));
+//! assert!(Version::parse("20260625071935")? > Version::parse("20260624235959")?);
+//! # Ok(())
+//! # }
+//! ```
 //!
-//! - `>=3` matches every version from the start of the line `3`, including `3.0-rc.1`.
-//! - `<4` matches every version before the start of the line `4`, so it does not match
-//!   `4.0-rc.1`.
-//! - `>3` matches every version after the end of the line `3`, so it matches `4.0-rc.1`,
-//!   but not `3.1`. `>3.0` matches `3.1`.
-//! - `<=3` matches every version up to the end of the line `3`, such as `3.9`.
-//! - `3.*`, or `==3.*`, matches every version of the line `3`, and `!=3.*` matches every
-//!   other version.
-//! - `==3` and `!=3` compare exact versions, so `==3` matches `3.0`, but not `3.0-rc.1`
-//!   or `3.0.1`. A bare version, such as `3`, means `==3`.
+//! [Semantic Versioning]: https://semver.org
+//! [Calendar Versioning]: https://calver.org
 //!
-//! A requirement like `>=3,<4` therefore matches the whole line `3`, including
-//! its prereleases, but not `4.0-rc.1`. A comparator's version with a
-//! prerelease, such as `>=3-rc.2` or `<4-rc.2`, compares in the total order.
+//! # Versions
 //!
-//! Serde support (behind the `serde` feature, enabled by default) uses string
-//! representations for [`Version`], [`VersionReq`], [`Comparator`], and
-//! [`Operator`]. Deserialization validates the same grammar as the
-//! corresponding parser.
+//! A [`Version`] consists of one or more numeric _release components_, an optional
+//! _prerelease_, and optional _build metadata_:
+//!
+//! ```text
+//! version    = release [ "-" prerelease ] [ "+" build ]
+//! release    = number { "." number }
+//! prerelease = identifier { "." identifier }
+//! build      = identifier { "." identifier }
+//! number     = digit { digit }
+//! identifier = ( letter | digit | "-" ) { letter | digit | "-" }
+//! ```
+//!
+//! Numbers, including numeric prerelease identifiers, must fit into a [`u64`].
+//! Letters are ASCII letters. Leading zeros are allowed, and whitespace around a
+//! version is ignored. The grammar covers common schemes as they are usually
+//! written:
+//!
+//! | Scheme                  | Examples                                   |
+//! | ----------------------- | ------------------------------------------ |
+//! | Semantic Versioning     | `1.4.2`, `2.0.0-rc.1`, `1.4.2+build.7`     |
+//! | Calendar Versioning     | `2026.6`, `2026.06.25`, `24.04`            |
+//! | Serial numbers          | `42`, `1337`                               |
+//! | Timestamps              | `20260625071935`                           |
+//! | Dates with a revision   | `2026.6.25.2`                              |
+//!
+//! Versions in other formats must be converted first. For example, a leading `v`,
+//! as in `v1.2`, is not part of the grammar. Debian versions, such as `1:2.27~rc1-3`,
+//! use `~` for prereleases and `-` for package revisions, so they need translating
+//! rather than parsing.
+//!
+//! ## Precedence
+//!
+//! Versions are ordered by _precedence_, which follows Semantic Versioning and
+//! generalizes it to any number of release components:
+//!
+//! 1. Release components compare numerically from left to right. Missing components count
+//!    as zero, so `5`, `5.0`, and `5.0.0` have the same precedence, and `5.10` follows
+//!    `5.9`.
+//! 2. With equal release components, a prerelease precedes the release, so `1.0-rc.1`
+//!    precedes `1.0`.
+//! 3. Two prereleases compare identifier by identifier. Numeric identifiers compare
+//!    numerically and precede alphanumeric identifiers, which compare by ASCII order. If
+//!    all identifiers of one prerelease start the other, the shorter one precedes.
+//! 4. Leading zeros and build metadata do not affect precedence.
+//!
+//! ```
+//! use anyver::Version;
+//!
+//! # fn main() -> Result<(), anyver::ParseError> {
+//! let ordered = [
+//!     "1.0-alpha", "1.0-alpha.1", "1.0-alpha.beta", "1.0-beta", "1.0-beta.2",
+//!     "1.0-beta.11", "1.0-rc.1", "1.0", "1.0.1", "1.1", "1.10",
+//! ];
+//! for pair in ordered.windows(2) {
+//!     assert!(Version::parse(pair[0])? < Version::parse(pair[1])?);
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Identity
+//!
+//! A [`Version`] keeps the exact spelling it was parsed from, and [`Display`] returns
+//! it unchanged. Equality and hashing compare this spelling, so `5`, `5.0`, and
+//! `5+build.7` are different values, even though they have the same precedence.
+//! [`Ord`] orders by precedence and breaks ties by spelling, which keeps it
+//! consistent with equality. Sorting therefore puts versions in precedence order and
+//! keeps every distinct spelling:
+//!
+//! ```
+//! use std::collections::BTreeSet;
+//!
+//! use anyver::{Version, VersionReq};
+//!
+//! # fn main() -> Result<(), anyver::ParseError> {
+//! let versions: BTreeSet<Version> = ["1.0", "0.9", "1", "1.0-rc.1"]
+//!     .into_iter()
+//!     .map(Version::parse)
+//!     .collect::<Result<_, _>>()?;
+//! let sorted: Vec<String> = versions.iter().map(ToString::to_string).collect();
+//! assert_eq!(sorted, ["0.9", "1.0-rc.1", "1", "1.0"]);
+//!
+//! // Whether two versions have the same precedence is a question for a requirement.
+//! assert_ne!(Version::parse("1")?, Version::parse("1.0")?);
+//! assert!(VersionReq::parse("==1")?.matches(&Version::parse("1.0+build.7")?));
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`Display`]: std::fmt::Display
+//!
+//! # Requirements
+//!
+//! A [`VersionReq`] is a comma-separated list of [`Comparator`]s, all of which must
+//! match, such as `>=2.20,<3`. A requirement consisting of `*` alone matches every
+//! version. A comparator is an [`Operator`] followed by a version, where `=` is the
+//! same as `==` and a version without an operator means `==`. Cargo and npm
+//! shorthands such as `^` and `~` are not supported, because they presume a scheme.
+//!
+//! ## Lines
+//!
+//! Requirements are usually written before the versions they refer to exist. Suppose
+//! an app works with version 3 of a runtime and declares `>=3,<4` while version 3 is
+//! still in development. Testing the app with the release candidate `3.0-rc.1`
+//! should not require changing the declaration. Conversely, `4.0-rc.1` already
+//! contains the changes of version 4 and should not satisfy `<4`. Plain precedence
+//! gets both cases wrong, because `3.0-rc.1` precedes `3` and `4.0-rc.1` precedes `4`.
+//!
+//! A comparator's version without a prerelease therefore names a _line_: all versions
+//! whose release components, padded with zeros, start with the comparator's release
+//! components, including their prereleases. The line `3` contains `3.0-rc.1`, `3`,
+//! and `3.5.1`. The line `3.0` contains `3.0-rc.1` and `3.0.5`, but not `3.1`. Each
+//! operator refers to the start or the end of its line:
+//!
+//! | Comparator | Meaning                          | Example Match       | Example Mismatch    |
+//! | ---------- | -------------------------------- | ------------------- | ------------------- |
+//! | `>=3`      | From the start of the line `3`   | `3.0-rc.1`, `3.9`   | `2.9`               |
+//! | `<4`       | Before the start of the line `4` | `3.9`               | `4.0-rc.1`          |
+//! | `>3`       | After the end of the line `3`    | `4.0-rc.1`          | `3.1`               |
+//! | `<=3`      | Up to the end of the line `3`    | `3.9`               | `4.0-rc.1`          |
+//! | `3.*`      | Within the line `3`              | `3.0-rc.1`, `3.5.1` | `4.0-rc.1`          |
+//! | `!=3.*`    | Outside the line `3`             | `4.0`               | `3.2`               |
+//! | `==3`      | Exactly the precedence of `3`    | `3.0`, `3+build.7`  | `3.0-rc.1`, `3.0.1` |
+//! | `!=3`      | Any other precedence             | `3.0.1`             | `3.0`               |
+//!
+//! For `>` and `<=`, the number of release components matters: `>3` does not match
+//! `3.1`, but `>3.0` does. For `>=` and `<`, it does not, because every line starts
+//! with its first prerelease, so `>=3` and `>=3.0` are the same. `==` and `!=`
+//! compare precedence, so a version without an operator pins exactly one version.
+//! Wildcards, such as `3.*`, are only allowed with `=`, `==`, and `!=`, and their
+//! version must not have a prerelease or build metadata.
+//!
+//! A comparator's version with a prerelease, such as `>=3-rc.2` or `<4-rc.2`,
+//! compares by precedence instead. Use it to admit only later release candidates or
+//! to let prereleases of the next line in:
+//!
+//! ```
+//! use anyver::{Version, VersionReq};
+//!
+//! # fn main() -> Result<(), anyver::ParseError> {
+//! let v = |input: &str| Version::parse(input);
+//!
+//! let line = VersionReq::parse(">=3,<4")?;
+//! assert!(line.matches(&v("3.0-rc.1")?));
+//! assert!(line.matches(&v("3.9.2")?));
+//! assert!(!line.matches(&v("4.0-rc.1")?));
+//!
+//! // `>` and `<=` respect the precision of their version.
+//! assert!(!VersionReq::parse(">3")?.matches(&v("3.1")?));
+//! assert!(VersionReq::parse(">3.0")?.matches(&v("3.1")?));
+//!
+//! // Wildcards match a whole line and combine with other comparators.
+//! let june = VersionReq::parse("2026.6.*")?;
+//! assert!(june.matches(&v("2026.06.30")?));
+//! assert!(!june.matches(&v("2026.7.1")?));
+//! assert!(VersionReq::parse("3.*,>=3.2")?.matches(&v("3.2-rc.1")?));
+//!
+//! // Prerelease bounds compare by precedence.
+//! assert!(!VersionReq::parse(">=3-rc.2")?.matches(&v("3-rc.1")?));
+//! assert!(VersionReq::parse("<4-rc.2")?.matches(&v("4-rc.1")?));
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Errors
+//!
+//! Parsing fails with a [`ParseError`] that names the input and the problem:
+//!
+//! ```
+//! use anyver::{Version, VersionReq};
+//!
+//! let error = Version::parse("1.x").unwrap_err();
+//! assert_eq!(error.input(), "1.x");
+//! assert_eq!(error.message(), "release components must be numeric");
+//!
+//! assert!(VersionReq::parse(">=3.*").is_err());
+//! assert!(VersionReq::parse("^1.2").is_err());
+//! ```
+//!
+//! # Serde
+//!
+//! With the `serde` feature, enabled by default, [`Version`], [`VersionReq`],
+//! [`Comparator`], and [`Operator`] serialize as strings. Deserialization applies the
+//! same grammar as parsing, so invalid versions are rejected when the surrounding
+//! document is read:
+//!
+//! ```
+//! # #[cfg(feature = "serde")]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use anyver::{Version, VersionReq};
+//! use serde::Deserialize;
+//!
+//! #[derive(Deserialize)]
+//! struct Dependency {
+//!     id: String,
+//!     version: VersionReq,
+//! }
+//!
+//! let dependency: Dependency =
+//!     serde_json::from_str(r#"{ "id": "docker.compose", "version": ">=2.20,<3" }"#)?;
+//! assert_eq!(dependency.id, "docker.compose");
+//! assert!(dependency.version.matches(&Version::parse("2.27.0")?));
+//!
+//! assert!(serde_json::from_str::<Version>(r#""1..2""#).is_err());
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "serde"))]
+//! # fn main() {}
+//! ```
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -61,7 +256,27 @@ use serde::Serialize;
 #[cfg(feature = "serde")]
 use serde::Serializer;
 
-/// A normalized version.
+/// A version, such as `1.4.2`, `2026.06.25`, or `2.0.0-rc.1+build.7`.
+///
+/// The [crate documentation](crate#versions) defines the grammar, the precedence
+/// rules, and how equality differs from precedence.
+///
+/// # Examples
+///
+/// ```
+/// use anyver::Version;
+///
+/// # fn main() -> Result<(), anyver::ParseError> {
+/// let version = Version::parse("2.0.0-rc.1+build.7")?;
+/// assert_eq!(version.release(), [2, 0, 0]);
+/// assert!(version.is_prerelease());
+/// assert_eq!(version.build_metadata(), ["build", "7"]);
+/// assert_eq!(version.to_string(), "2.0.0-rc.1+build.7");
+///
+/// assert!(version < Version::parse("2.0.0")?);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct Version {
     display: String,
@@ -71,33 +286,76 @@ pub struct Version {
 }
 
 impl Version {
-    /// Parse a version.
+    /// Parse a version, ignoring surrounding whitespace.
+    ///
+    /// This is the same as [`str::parse`].
     ///
     /// # Errors
     ///
-    /// Returns [`ParseError`] if `input` does not follow the version grammar
-    /// described at the crate root.
+    /// Returns a [`ParseError`] if `input` does not follow the
+    /// [version grammar](crate#versions).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use anyver::Version;
+    ///
+    /// # fn main() -> Result<(), anyver::ParseError> {
+    /// assert_eq!(Version::parse(" 5.2 ")?.to_string(), "5.2");
+    /// assert!(Version::parse("v5.2").is_err());
+    /// assert!(Version::parse("5.2-").is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn parse(input: &str) -> Result<Self, ParseError> {
         input.parse()
     }
 
-    /// Numeric release components as parsed.
+    /// Release components as numbers, including trailing zeros.
     ///
-    /// Trailing zero components are preserved here but do not affect precedence.
+    /// ```
+    /// use anyver::Version;
+    ///
+    /// # fn main() -> Result<(), anyver::ParseError> {
+    /// assert_eq!(Version::parse("05.2.0")?.release(), [5, 2, 0]);
+    /// assert_eq!(Version::parse("20260625071935")?.release(), [20_260_625_071_935]);
+    /// # Ok(())
+    /// # }
+    /// ```
     #[must_use]
     pub fn release(&self) -> &[u64] {
         &self.release
     }
 
-    /// Whether this version has a prerelease suffix.
+    /// Whether this version has a prerelease, such as `rc.1` in `2.0.0-rc.1`.
+    ///
+    /// ```
+    /// use anyver::Version;
+    ///
+    /// # fn main() -> Result<(), anyver::ParseError> {
+    /// assert!(Version::parse("2.0.0-rc.1")?.is_prerelease());
+    /// assert!(!Version::parse("2.0.0+build.7")?.is_prerelease());
+    /// # Ok(())
+    /// # }
+    /// ```
     #[must_use]
     pub fn is_prerelease(&self) -> bool {
         !self.prerelease.is_empty()
     }
 
-    /// Build metadata identifiers.
+    /// Build metadata identifiers, such as `["build", "7"]` for `1.0+build.7`.
     ///
     /// Build metadata does not affect precedence or requirement matching.
+    ///
+    /// ```
+    /// use anyver::Version;
+    ///
+    /// # fn main() -> Result<(), anyver::ParseError> {
+    /// assert_eq!(Version::parse("1.0+build.7")?.build_metadata(), ["build", "7"]);
+    /// assert!(Version::parse("1.0")?.build_metadata().is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
     #[must_use]
     pub fn build_metadata(&self) -> &[String] {
         &self.build_metadata
@@ -255,42 +513,100 @@ impl<'de> Deserialize<'de> for Version {
     }
 }
 
-/// A conjunction of version comparators.
+/// A version requirement, such as `>=2.20,<3`, `3.*`, or `*`.
+///
+/// A requirement matches a version if all of its [`Comparator`]s match it. The
+/// [crate documentation](crate#requirements) defines the syntax and how each
+/// comparator matches.
+///
+/// [`Display`](std::fmt::Display) writes a requirement in a normalized form: without
+/// whitespace, with `==` for comparators without an operator, and with `*` for a
+/// requirement matching every version.
+///
+/// # Examples
+///
+/// ```
+/// use anyver::{Version, VersionReq};
+///
+/// # fn main() -> Result<(), anyver::ParseError> {
+/// let requirement = VersionReq::parse(" >= 2.20 , < 3 ")?;
+/// assert!(requirement.matches(&Version::parse("2.27.0")?));
+/// assert!(!requirement.matches(&Version::parse("3.0-rc.1")?));
+/// assert_eq!(requirement.to_string(), ">=2.20,<3");
+///
+/// assert_eq!(VersionReq::parse("5.2")?.to_string(), "==5.2");
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VersionReq {
     comparators: Vec<Comparator>,
 }
 
 impl VersionReq {
-    /// A requirement matching every version.
+    /// A requirement matching every version, written as `*`.
+    ///
+    /// ```
+    /// use anyver::{Version, VersionReq};
+    ///
+    /// # fn main() -> Result<(), anyver::ParseError> {
+    /// assert_eq!(VersionReq::parse("*")?, VersionReq::any());
+    /// assert!(VersionReq::any().matches(&Version::parse("0.1-alpha")?));
+    /// # Ok(())
+    /// # }
+    /// ```
     #[must_use]
     pub fn any() -> Self {
         Self::default()
     }
 
-    /// Parse a version requirement.
+    /// Parse a version requirement, ignoring whitespace around comparators.
+    ///
+    /// This is the same as [`str::parse`].
     ///
     /// # Errors
     ///
-    /// Returns [`ParseError`] if `input` is not a comma-separated list of
-    /// comparators (or `*`) following the grammar described at the crate root.
+    /// Returns a [`ParseError`] if `input` is neither `*` nor a comma-separated list
+    /// of [comparators](crate#requirements).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use anyver::VersionReq;
+    ///
+    /// assert!(VersionReq::parse(">=3,<4").is_ok());
+    /// assert!(VersionReq::parse(">=3,").is_err());
+    /// assert!(VersionReq::parse("^3").is_err());
+    /// assert!(VersionReq::parse("*,<4").is_err());
+    /// ```
     pub fn parse(input: &str) -> Result<Self, ParseError> {
         input.parse()
     }
 
-    /// Comparators in this requirement.
+    /// The comparators of this requirement, in the order they were written.
+    ///
+    /// ```
+    /// use anyver::{Operator, VersionReq};
+    ///
+    /// # fn main() -> Result<(), anyver::ParseError> {
+    /// let requirement = VersionReq::parse(">=3,<4")?;
+    /// let operators: Vec<Operator> = requirement.comparators().iter().map(|c| c.op).collect();
+    /// assert_eq!(operators, [Operator::GreaterEq, Operator::Less]);
+    /// # Ok(())
+    /// # }
+    /// ```
     #[must_use]
     pub fn comparators(&self) -> &[Comparator] {
         &self.comparators
     }
 
-    /// Whether this requirement matches every version.
+    /// Whether this requirement matches every version, which is the case for `*`.
     #[must_use]
     pub fn is_any(&self) -> bool {
         self.comparators.is_empty()
     }
 
-    /// Whether this requirement matches the given version.
+    /// Whether all comparators of this requirement match `version`.
     #[must_use]
     pub fn matches(&self, version: &Version) -> bool {
         self.comparators
@@ -365,24 +681,49 @@ impl<'de> Deserialize<'de> for VersionReq {
     }
 }
 
-/// A single version comparator.
+/// One comparison of a [`VersionReq`], such as `>=3`, `<4-rc.2`, or `!=3.*`.
 ///
-/// The crate root describes how comparators match versions.
+/// The [crate documentation](crate#lines) defines how comparators match versions.
+/// The fields are public, so comparators can also be built directly.
+///
+/// # Examples
+///
+/// ```
+/// use anyver::{Comparator, Operator, Version};
+///
+/// # fn main() -> Result<(), anyver::ParseError> {
+/// let at_least_3 = Comparator {
+///     op: Operator::GreaterEq,
+///     version: Version::parse("3")?,
+///     wildcard: false,
+/// };
+/// assert!(at_least_3.matches(&Version::parse("3.0-rc.1")?));
+/// assert_eq!(at_least_3.to_string(), ">=3");
+///
+/// let not_line_3: Comparator = "!=3.*".parse()?;
+/// assert!(not_line_3.wildcard);
+/// assert!(!not_line_3.matches(&Version::parse("3.2")?));
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Comparator {
-    /// Comparison operator.
+    /// The operator, such as `>=`.
     pub op: Operator,
-    /// Version to compare against.
+    /// The version to compare against.
     pub version: Version,
-    /// Whether the comparator matches the whole line of its version, as in `3.*`.
+    /// Whether the comparator refers to the whole line of its version, as in `3.*`.
     ///
-    /// Only [`Operator::Equal`] and [`Operator::NotEqual`] support wildcards, and the
-    /// version must not have a prerelease.
+    /// The parser only accepts wildcards with [`Operator::Equal`] and
+    /// [`Operator::NotEqual`] and a version without a prerelease or build metadata.
+    /// A directly built wildcard comparator with another operator matches like
+    /// [`Operator::Equal`].
     pub wildcard: bool,
 }
 
 impl Comparator {
-    /// Whether this comparator matches the given version.
+    /// Whether this comparator matches `version`, following the
+    /// [line rules](crate#lines).
     #[must_use]
     pub fn matches(&self, version: &Version) -> bool {
         if self.wildcard {
@@ -474,20 +815,24 @@ impl<'de> Deserialize<'de> for Comparator {
     }
 }
 
-/// Version comparator operator.
+/// The operator of a [`Comparator`].
+///
+/// Each variant describes how it matches a comparator version without a prerelease.
+/// With a prerelease version, all operators compare by precedence. The
+/// [crate documentation](crate#lines) explains lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operator {
-    /// `==`
+    /// `==` or `=`: the same precedence, or, with a wildcard, within the line.
     Equal,
-    /// `!=`
+    /// `!=`: a different precedence, or, with a wildcard, outside the line.
     NotEqual,
-    /// `>`
+    /// `>`: after the end of the line, so `>3` does not match `3.1`.
     Greater,
-    /// `>=`
+    /// `>=`: from the start of the line, so `>=3` matches `3.0-rc.1`.
     GreaterEq,
-    /// `<`
+    /// `<`: before the start of the line, so `<4` does not match `4.0-rc.1`.
     Less,
-    /// `<=`
+    /// `<=`: up to the end of the line, so `<=3` matches `3.9`.
     LessEq,
 }
 
@@ -544,7 +889,10 @@ impl<'de> Deserialize<'de> for Operator {
     }
 }
 
-/// Error returned when parsing a [`Version`] or [`VersionReq`].
+/// An error parsing a [`Version`], [`VersionReq`], [`Comparator`], or [`Operator`].
+///
+/// [`Display`](std::fmt::Display) combines the input and the problem, as in
+/// `error parsing "1.x": release components must be numeric`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ParseError {
@@ -560,13 +908,13 @@ impl ParseError {
         }
     }
 
-    /// Input that failed to parse.
+    /// The input that failed to parse, without surrounding whitespace.
     #[must_use]
     pub fn input(&self) -> &str {
         &self.input
     }
 
-    /// Human-readable parse error.
+    /// What is wrong with the input, such as `release components must be numeric`.
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message

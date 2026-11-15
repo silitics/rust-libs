@@ -1,4 +1,4 @@
-//! Version parsing and requirement matching for any versioning scheme.
+//! Version parsing and requirement matching across versioning schemes.
 //!
 //! Software in the wild is versioned in many ways. Libraries use [Semantic
 //! Versioning], operating system images often use [Calendar Versioning], firmware
@@ -44,7 +44,8 @@
 //! identifier = ( letter | digit | "-" ) { letter | digit | "-" }
 //! ```
 //!
-//! Numbers, including numeric prerelease identifiers, must fit into a [`u64`].
+//! Release components and numeric prerelease identifiers must fit into a [`u64`].
+//! Build metadata identifiers are kept as text, so they have no numeric limit.
 //! Letters are ASCII letters. Leading zeros are allowed, and whitespace around a
 //! version is ignored. The grammar covers common schemes as they are usually
 //! written:
@@ -74,8 +75,11 @@
 //!    precedes `1.0`.
 //! 3. Two prereleases compare identifier by identifier. Numeric identifiers compare
 //!    numerically and precede alphanumeric identifiers, which compare by ASCII order. If
-//!    all identifiers of one prerelease start the other, the shorter one precedes.
-//! 4. Leading zeros and build metadata do not affect precedence.
+//!    one prerelease is a prefix of the other, the shorter one precedes, so `1.0-alpha`
+//!    precedes `1.0-alpha.1`.
+//! 4. Leading zeros of release components and numeric prerelease identifiers do not
+//!    affect precedence, so `05.1-rc.01` and `5.1-rc.1` have the same precedence. Build
+//!    metadata does not affect precedence either.
 //!
 //! ```
 //! use anyver::Version;
@@ -94,8 +98,9 @@
 //!
 //! ## Identity
 //!
-//! A [`Version`] keeps the exact spelling it was parsed from, and [`Display`] returns
-//! it unchanged. Equality and hashing compare this spelling, so `5`, `5.0`, and
+//! A [`Version`] keeps the exact spelling it was parsed from, without surrounding
+//! whitespace, and [`Display`] returns it unchanged. Equality and hashing compare
+//! this spelling, so `5`, `5.0`, and
 //! `5+build.7` are different values, even though they have the same precedence.
 //! [`Ord`] orders by precedence and breaks ties by spelling, which keeps it
 //! consistent with equality. Sorting therefore puts versions in precedence order and
@@ -104,7 +109,7 @@
 //! ```
 //! use std::collections::BTreeSet;
 //!
-//! use anyver::{Version, VersionReq};
+//! use anyver::Version;
 //!
 //! # fn main() -> Result<(), anyver::ParseError> {
 //! let versions: BTreeSet<Version> = ["1.0", "0.9", "1", "1.0-rc.1"]
@@ -113,10 +118,7 @@
 //!     .collect::<Result<_, _>>()?;
 //! let sorted: Vec<String> = versions.iter().map(ToString::to_string).collect();
 //! assert_eq!(sorted, ["0.9", "1.0-rc.1", "1", "1.0"]);
-//!
-//! // Whether two versions have the same precedence is a question for a requirement.
 //! assert_ne!(Version::parse("1")?, Version::parse("1.0")?);
-//! assert!(VersionReq::parse("==1")?.matches(&Version::parse("1.0+build.7")?));
 //! # Ok(())
 //! # }
 //! ```
@@ -131,6 +133,10 @@
 //! same as `==` and a version without an operator means `==`. Cargo and npm
 //! shorthands such as `^` and `~` are not supported, because they presume a scheme.
 //!
+//! Matching ignores how the matched version is spelled, so `==1` matches `1.0` and
+//! `1.0+build.7`. To check whether two versions have the same precedence, match one
+//! against an `==` requirement for the other.
+//!
 //! ## Lines
 //!
 //! Requirements are usually written before the versions they refer to exist. Suppose
@@ -143,8 +149,9 @@
 //! A comparator's version without a prerelease therefore names a _line_: all versions
 //! whose release components, padded with zeros, start with the comparator's release
 //! components, including their prereleases. The line `3` contains `3.0-rc.1`, `3`,
-//! and `3.5.1`. The line `3.0` contains `3.0-rc.1` and `3.0.5`, but not `3.1`. Each
-//! operator refers to the start or the end of its line:
+//! and `3.5.1`. The line `3.0` contains `3.0-rc.1` and `3.0.5`, but not `3.1`. The
+//! ordering operators refer to the start or the end of a line, wildcards to the line
+//! as a whole, and `==` and `!=` to precedence:
 //!
 //! | Comparator | Meaning                          | Example Match       | Example Mismatch    |
 //! | ---------- | -------------------------------- | ------------------- | ------------------- |
@@ -154,19 +161,22 @@
 //! | `<=3`      | Up to the end of the line `3`    | `3.9`               | `4.0-rc.1`          |
 //! | `3.*`      | Within the line `3`              | `3.0-rc.1`, `3.5.1` | `4.0-rc.1`          |
 //! | `!=3.*`    | Outside the line `3`             | `4.0`               | `3.2`               |
-//! | `==3`      | Exactly the precedence of `3`    | `3.0`, `3+build.7`  | `3.0-rc.1`, `3.0.1` |
+//! | `==3`      | The same precedence as `3`       | `3.0`, `3+build.7`  | `3.0-rc.1`, `3.0.1` |
 //! | `!=3`      | Any other precedence             | `3.0.1`             | `3.0`               |
 //!
-//! For `>` and `<=`, the number of release components matters: `>3` does not match
-//! `3.1`, but `>3.0` does. For `>=` and `<`, it does not, because every line starts
-//! with its first prerelease, so `>=3` and `>=3.0` are the same. `==` and `!=`
-//! compare precedence, so a version without an operator pins exactly one version.
+//! For `>` and `<=`, appending zero release components narrows the line: `>3` does
+//! not match `3.1`, but `>3.0` does. For `>=` and `<`, appending zero release
+//! components changes nothing, because it does not move where the line starts, so
+//! `>=3` and `>=3.0` match the same versions. `==` and `!=` ignore
+//! lines and compare precedence, so `==3`, or just `3`, pins version 3 however it is
+//! spelled.
 //! Wildcards, such as `3.*`, are only allowed with `=`, `==`, and `!=`, and their
 //! version must not have a prerelease or build metadata.
 //!
-//! A comparator's version with a prerelease, such as `>=3-rc.2` or `<4-rc.2`,
-//! compares by precedence instead. Use it to admit only later release candidates or
-//! to let prereleases of the next line in:
+//! A comparator's version with a prerelease compares by precedence instead. For
+//! example, `>=3-rc.2` matches `3-rc.2`, `3`, and every later version, but not
+//! `3-rc.1`. `<4-rc.2` matches `4-rc.1`, but not `4-rc.2` or `4`, so it admits early
+//! prereleases of the next line:
 //!
 //! ```
 //! use anyver::{Version, VersionReq};
@@ -190,8 +200,12 @@
 //! assert!(VersionReq::parse("3.*,>=3.2")?.matches(&v("3.2-rc.1")?));
 //!
 //! // Prerelease bounds compare by precedence.
-//! assert!(!VersionReq::parse(">=3-rc.2")?.matches(&v("3-rc.1")?));
-//! assert!(VersionReq::parse("<4-rc.2")?.matches(&v("4-rc.1")?));
+//! let from_rc_2 = VersionReq::parse(">=3-rc.2")?;
+//! assert!(from_rc_2.matches(&v("3-rc.2")?) && from_rc_2.matches(&v("3")?));
+//! assert!(!from_rc_2.matches(&v("3-rc.1")?));
+//! let before_4_rc_2 = VersionReq::parse("<4-rc.2")?;
+//! assert!(before_4_rc_2.matches(&v("4-rc.1")?));
+//! assert!(!before_4_rc_2.matches(&v("4")?));
 //! # Ok(())
 //! # }
 //! ```
@@ -520,8 +534,9 @@ impl<'de> Deserialize<'de> for Version {
 /// comparator matches.
 ///
 /// [`Display`](std::fmt::Display) writes a requirement in a normalized form: without
-/// whitespace, with `==` for comparators without an operator, and with `*` for a
-/// requirement matching every version.
+/// whitespace, with `==` for `=` and for comparators without an operator, and as `*`
+/// for [`VersionReq::any`]. It keeps the order of the comparators and the spelling of
+/// their versions.
 ///
 /// # Examples
 ///
@@ -600,7 +615,9 @@ impl VersionReq {
         &self.comparators
     }
 
-    /// Whether this requirement matches every version, which is the case for `*`.
+    /// Whether this is the requirement `*`, which has no comparators.
+    ///
+    /// A requirement such as `>=0` also matches every version, but is not `*`.
     #[must_use]
     pub fn is_any(&self) -> bool {
         self.comparators.is_empty()
@@ -716,8 +733,11 @@ pub struct Comparator {
     ///
     /// The parser only accepts wildcards with [`Operator::Equal`] and
     /// [`Operator::NotEqual`] and a version without a prerelease or build metadata.
-    /// A directly built wildcard comparator with another operator matches like
-    /// [`Operator::Equal`].
+    /// A directly built wildcard comparator matches by release components only,
+    /// ignoring the version's prerelease and build metadata, and with an operator
+    /// other than [`Operator::NotEqual`] it matches like [`Operator::Equal`]. Its
+    /// [`Display`](std::fmt::Display) output, and therefore its serialized form, can
+    /// only be parsed again if it follows the parser's rules.
     pub wildcard: bool,
 }
 
@@ -817,8 +837,9 @@ impl<'de> Deserialize<'de> for Comparator {
 
 /// The operator of a [`Comparator`].
 ///
-/// Each variant describes how it matches a comparator version without a prerelease.
-/// With a prerelease version, all operators compare by precedence. The
+/// Each variant describes how it matches for a comparator version without a
+/// prerelease. Without a wildcard and with a prerelease version, all operators
+/// compare by precedence. The
 /// [crate documentation](crate#lines) explains lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operator {
@@ -840,6 +861,7 @@ impl FromStr for Operator {
     type Err = ParseError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let input = input.trim();
         match input {
             "==" | "=" => Ok(Self::Equal),
             "!=" => Ok(Self::NotEqual),
@@ -909,6 +931,9 @@ impl ParseError {
     }
 
     /// The input that failed to parse, without surrounding whitespace.
+    ///
+    /// For a requirement, this is the part that failed where possible: parsing
+    /// `>=3,==x` reports the version `x`.
     #[must_use]
     pub fn input(&self) -> &str {
         &self.input
@@ -1163,6 +1188,34 @@ mod tests {
         assert!(version("1.0-rc.1+build.5") < version("1.0+build.5"));
         assert!(req("==1.0+build.7").matches(&version("1.0+build.8")));
         assert!(req("==1.0").matches(&version("1.0+build.7")));
+    }
+
+    #[test]
+    fn leading_zeroes_and_build_metadata_do_not_affect_matching() {
+        assert!(req("==5.1-rc.1").matches(&version("05.1-rc.01")));
+        assert!(req("==1").matches(&version("1.0+build.7")));
+        assert!(version("1-01a").precedence(&version("1-1a")).is_lt());
+    }
+
+    #[test]
+    fn any_requirement_is_only_star() {
+        assert!(req("*").is_any());
+        assert!(!req(">=0").is_any());
+        assert_eq!(VersionReq::any().to_string(), "*");
+        assert_eq!(req(" = 5 , >3-rc.1 ").to_string(), "==5,>3-rc.1");
+    }
+
+    #[test]
+    fn operators_ignore_surrounding_whitespace() {
+        assert_eq!(" >= ".parse::<Operator>(), Ok(Operator::GreaterEq));
+        let error = " => ".parse::<Operator>().err();
+        assert_eq!(error.as_ref().map(ParseError::input), Some("=>"));
+    }
+
+    #[test]
+    fn requirement_errors_report_the_failing_part() {
+        let error = VersionReq::parse(">=3,==x").err();
+        assert_eq!(error.as_ref().map(ParseError::input), Some("x"));
     }
 
     #[test]

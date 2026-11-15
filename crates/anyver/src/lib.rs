@@ -128,11 +128,12 @@
 //!
 //! # Requirements
 //!
-//! A [`VersionReq`] is a comma-separated list of [`Comparator`]s, all of which must
-//! match, such as `>=2.20,<3`. A requirement consisting of `*` alone matches every
-//! version. A comparator is an [`Operator`] followed by a version, where `=` is the
-//! same as `==` and a version without an operator means `==`. Cargo and npm
-//! shorthands such as `^` and `~` are not supported, because they presume a scheme.
+//! A [`VersionReq`] is a comma-separated list of [`Comparator`]s that must all
+//! match, such as `>=2.20,<3`. Each comparator pairs an [`Operator`] with a version,
+//! as in `>=2.20`. The operators are `==`, `!=`, `>`, `>=`, `<`, and `<=`, and `=` is
+//! an alias for `==`. A version without an operator, such as `2.20`, means `==2.20`.
+//! The requirement `*` matches every version. Cargo and npm shorthands such as `^`
+//! and `~` are not supported, because they presume a scheme.
 //!
 //! Matching ignores how the matched version is spelled, so `==1` matches `1.0` and
 //! `1.0+build.7`. To check whether two versions have the same precedence, match one

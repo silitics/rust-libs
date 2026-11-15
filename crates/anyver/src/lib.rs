@@ -15,6 +15,13 @@
 //! The parsed spelling is preserved for display. Build metadata is preserved
 //! but ignored for equality, hashing, ordering, and requirement matching.
 //!
+//! A [`VersionReq`] is a comma-separated conjunction of [`Comparator`]s that
+//! compare versions in this order, with one exception taken from PEP 440: an
+//! exclusive upper bound without a prerelease, such as `<4`, also excludes
+//! prereleases of its version, such as `4.0-rc.1`. A requirement like `>=3,<4`
+//! therefore matches `3.5-beta` but not `4.0-rc.1`. An upper bound with a
+//! prerelease, such as `<4-rc.2`, compares in the total order.
+//!
 //! Serde support (behind the `serde` feature, enabled by default) uses string
 //! representations for [`Version`], [`VersionReq`], [`Comparator`], and
 //! [`Operator`]. Deserialization validates the same grammar as the
@@ -346,6 +353,9 @@ pub struct Comparator {
 
 impl Comparator {
     /// Whether this comparator matches the given version.
+    ///
+    /// An exclusive upper bound without a prerelease, such as `<4`, also excludes
+    /// prereleases of its version, such as `4.0-rc.1`, as in PEP 440.
     #[must_use]
     pub fn matches(&self, version: &Version) -> bool {
         match self.op {
@@ -353,9 +363,16 @@ impl Comparator {
             Operator::NotEqual => version != &self.version,
             Operator::Greater => version > &self.version,
             Operator::GreaterEq => version >= &self.version,
-            Operator::Less => version < &self.version,
+            Operator::Less => version < &self.version && !self.is_prerelease_of_bound(version),
             Operator::LessEq => version <= &self.version,
         }
+    }
+
+    /// Whether `version` is a prerelease of this comparator's final release.
+    fn is_prerelease_of_bound(&self, version: &Version) -> bool {
+        !self.version.is_prerelease()
+            && version.is_prerelease()
+            && compare_release(&version.release, &self.version.release) == Ordering::Equal
     }
 }
 
@@ -809,6 +826,30 @@ mod tests {
         assert!(requirement.is_any());
         assert!(requirement.matches(&version("0.1")));
         assert!(requirement.matches(&version("999.999")));
+    }
+
+    #[test]
+    fn exclusive_upper_bound_excludes_prereleases_of_its_version() {
+        let requirement = req(">=3,<4");
+        assert!(!requirement.matches(&version("4.0-rc.1")));
+        assert!(!requirement.matches(&version("4-0")));
+        assert!(requirement.matches(&version("3.5-beta")));
+        assert!(requirement.matches(&version("3.9")));
+        assert!(!req("<4.0.0").matches(&version("4-rc.1")));
+    }
+
+    #[test]
+    fn prerelease_upper_bound_keeps_total_order() {
+        assert!(req("<4-rc.2").matches(&version("4-rc.1")));
+        assert!(!req("<4-rc.2").matches(&version("4-rc.2")));
+        assert!(req("<1-alpha.1").matches(&version("1-alpha")));
+    }
+
+    #[test]
+    fn inclusive_bounds_keep_total_order() {
+        assert!(req("<=4").matches(&version("4.0-rc.1")));
+        assert!(!req(">=4").matches(&version("4.0-rc.1")));
+        assert!(!req("==4").matches(&version("4.0-rc.1")));
     }
 
     #[test]

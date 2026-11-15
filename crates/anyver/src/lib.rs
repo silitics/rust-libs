@@ -59,9 +59,10 @@
 //! | Dates with a revision   | `2026.6.25.2`                              |
 //!
 //! Versions in other formats must be converted first. For example, a leading `v`,
-//! as in `v1.2`, is not part of the grammar. Debian versions, such as `1:2.27~rc1-3`,
-//! use `~` for prereleases and `-` for package revisions, so they need translating
-//! rather than parsing.
+//! as in `v1.2`, is not part of the grammar. Debian versions use `~` for prereleases
+//! and `-` for package revisions. To convert `1:2.27~rc1-3`, for example, replace `~`
+//! with `-`, keep the package revision as build metadata, and drop the epoch `1:`,
+//! which gives `2.27-rc1+3`.
 //!
 //! ## Precedence
 //!
@@ -173,7 +174,7 @@
 //! Wildcards, such as `3.*`, are only allowed with `=`, `==`, and `!=`, and their
 //! version must not have a prerelease or build metadata.
 //!
-//! A comparator's version with a prerelease compares by precedence instead. For
+//! A comparator whose version has a prerelease compares by precedence. For
 //! example, `>=3-rc.2` matches `3-rc.2`, `3`, and every later version, but not
 //! `3-rc.1`. `<4-rc.2` matches `4-rc.1`, but not `4-rc.2` or `4`, so it admits early
 //! prereleases of the next line:

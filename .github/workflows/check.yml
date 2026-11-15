@@ -1,0 +1,26 @@
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          install: false
+      - name: Install Rust toolchain
+        run: mise install
+      - name: Check scripts, formatting, lints, and dependencies
+        run: mise run check
+      - name: Run tests with all features
+        run: mise run test

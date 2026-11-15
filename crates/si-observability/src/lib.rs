@@ -177,7 +177,7 @@ impl Initializer {
     pub fn init(self) -> FinalizeGuard {
         let stderr_filter = EnvFilter::builder()
             .with_default_directive(self.stderr_default_level.into())
-            .with_env_var(format!("{}_LOG", &self.env_var_prefix))
+            .with_env_var(format!("{}_LOG", self.env_var_prefix))
             .from_env_lossy();
         let stderr_format = self.stderr_logging_format.clone().unwrap_or_else(|| {
             let format_env_var = format!("{}_LOG_FORMAT", self.env_var_prefix);

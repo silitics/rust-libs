@@ -948,7 +948,8 @@ impl ByteUnit {
     ///
     /// Returns [`ByteUnitParseError`] if `ascii` is not a recognized unit suffix.
     pub const fn parse_ascii(ascii: &[u8]) -> Result<Self, ByteUnitParseError> {
-        // We exploit the fact that we know the maximal length to make this work in `const`.
+        // We exploit the fact that we know the maximal length to make this work in
+        // `const`.
         match ascii {
             [b1] => Self::parse_ascii_lowercase(&[b1.to_ascii_lowercase()]),
             [b1, b2] => {

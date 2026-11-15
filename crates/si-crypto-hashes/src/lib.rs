@@ -12,7 +12,11 @@
 //! // Parse the string representation of the expected hash.
 //! let digest = HashDigest::<Arc<[u8]>>::from_str(expected).unwrap();
 //! assert_eq!(digest.algorithm(), HashAlgorithm::Sha256);
-//! assert_eq!(digest.to_string(), expected);
+//!
+//! // The legacy feature changes the output format; both formats can be parsed.
+//! let formatted = digest.to_string();
+//! let parsed = HashDigest::<Arc<[u8]>>::from_str(&formatted).unwrap();
+//! assert_eq!(parsed, digest);
 //!
 //! // Compute a digest.
 //! let mut hasher = digest.algorithm().hasher();

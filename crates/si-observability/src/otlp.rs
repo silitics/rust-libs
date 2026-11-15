@@ -79,11 +79,15 @@ where
                         &otlp_env_var
                     })
                     .from_env_lossy()
-                    .add_directive("hyper=off".parse().unwrap())
-                    .add_directive("opentelemetry=off".parse().unwrap())
-                    .add_directive("tonic=off".parse().unwrap())
-                    .add_directive("h2=off".parse().unwrap())
-                    .add_directive("reqwest=off".parse().unwrap());
+                    .add_directive("hyper=off".parse().expect("static log filter is valid"))
+                    .add_directive(
+                        "opentelemetry=off"
+                            .parse()
+                            .expect("static log filter is valid"),
+                    )
+                    .add_directive("tonic=off".parse().expect("static log filter is valid"))
+                    .add_directive("h2=off".parse().expect("static log filter is valid"))
+                    .add_directive("reqwest=off".parse().expect("static log filter is valid"));
                 (
                     Some(
                         opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
@@ -134,16 +138,16 @@ pub(crate) struct FinalizeGuard {
 impl Drop for FinalizeGuard {
     fn drop(&mut self) {
         #[cfg(feature = "otlp-traces")]
-        if let Some(provider) = &self.tracer_provider {
-            if let Err(error) = provider.force_flush() {
-                eprintln!("ERROR: Unable to flush traces via OTLP. {error}");
-            }
+        if let Some(provider) = &self.tracer_provider
+            && let Err(error) = provider.force_flush()
+        {
+            eprintln!("ERROR: Unable to flush traces via OTLP. {error}");
         }
         #[cfg(feature = "otlp-logs")]
-        if let Some(provider) = &self.logger_provider {
-            if let Err(error) = provider.force_flush() {
-                eprintln!("ERROR: Unable to flush logs via OTLP. {error}");
-            }
+        if let Some(provider) = &self.logger_provider
+            && let Err(error) = provider.force_flush()
+        {
+            eprintln!("ERROR: Unable to flush logs via OTLP. {error}");
         }
     }
 }

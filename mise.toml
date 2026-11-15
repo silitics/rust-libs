@@ -1,0 +1,26 @@
+[tools]
+rust = { version = "nightly-2026-11-09", components = "rustfmt,clippy" }
+
+[tasks."doc"]
+shell = "nix develop \"{{config_root}}\" --command bash -euo pipefail -c"
+description = "Generate Rust documentation."
+run = '''
+RUSTDOCFLAGS="--cfg docsrs" cargo doc --document-private-items --all-features
+'''
+
+[tasks."test"]
+shell = "nix develop \"{{config_root}}\" --command bash -euo pipefail -c"
+description = "Run all feature tests."
+run = '''
+cargo test --all-features
+'''
+
+[tasks."check"]
+shell = "nix develop \"{{config_root}}\" --command bash -euo pipefail -c"
+description = "Check formatting, lints, and dependencies."
+run = "bash \"{{config_root}}/scripts/check.sh\""
+
+[tasks."fmt"]
+shell = "nix develop \"{{config_root}}\" --command bash -euo pipefail -c"
+description = "Format Rust and TOML."
+run = "bash \"{{config_root}}/scripts/fmt.sh\""

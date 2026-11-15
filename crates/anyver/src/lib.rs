@@ -284,8 +284,8 @@ use serde::Serializer;
 /// # fn main() -> Result<(), anyver::ParseError> {
 /// let version = Version::parse("2.0.0-rc.1+build.7")?;
 /// assert_eq!(version.release(), [2, 0, 0]);
-/// assert!(version.is_prerelease());
-/// assert_eq!(version.build_metadata(), ["build", "7"]);
+/// assert_eq!(version.prerelease(), Some("rc.1"));
+/// assert_eq!(version.build_metadata(), Some("build.7"));
 /// assert_eq!(version.to_string(), "2.0.0-rc.1+build.7");
 ///
 /// assert!(version < Version::parse("2.0.0")?);
@@ -297,7 +297,6 @@ pub struct Version {
     display: String,
     release: Vec<u64>,
     prerelease: Vec<PrereleaseIdentifier>,
-    build_metadata: Vec<String>,
 }
 
 impl Version {
@@ -342,6 +341,27 @@ impl Version {
         &self.release
     }
 
+    /// The prerelease as spelled, such as `rc.1` for `2.0.0-rc.1+build.7`.
+    ///
+    /// ```
+    /// use anyver::Version;
+    ///
+    /// # fn main() -> Result<(), anyver::ParseError> {
+    /// assert_eq!(Version::parse("2.0.0-rc.1+build.7")?.prerelease(), Some("rc.1"));
+    /// assert_eq!(Version::parse("2.0.0-beta-2")?.prerelease(), Some("beta-2"));
+    /// assert_eq!(Version::parse("2.0.0")?.prerelease(), None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn prerelease(&self) -> Option<&str> {
+        let version = self
+            .display
+            .split_once('+')
+            .map_or(self.display.as_str(), |(v, _)| v);
+        version.split_once('-').map(|(_, prerelease)| prerelease)
+    }
+
     /// Whether this version has a prerelease, such as `rc.1` in `2.0.0-rc.1`.
     ///
     /// ```
@@ -358,7 +378,7 @@ impl Version {
         !self.prerelease.is_empty()
     }
 
-    /// Build metadata identifiers, such as `["build", "7"]` for `1.0+build.7`.
+    /// The build metadata as spelled, such as `build.7` for `1.0+build.7`.
     ///
     /// Build metadata does not affect precedence or requirement matching.
     ///
@@ -366,14 +386,14 @@ impl Version {
     /// use anyver::Version;
     ///
     /// # fn main() -> Result<(), anyver::ParseError> {
-    /// assert_eq!(Version::parse("1.0+build.7")?.build_metadata(), ["build", "7"]);
-    /// assert!(Version::parse("1.0")?.build_metadata().is_empty());
+    /// assert_eq!(Version::parse("1.0+build.7")?.build_metadata(), Some("build.7"));
+    /// assert_eq!(Version::parse("1.0")?.build_metadata(), None);
     /// # Ok(())
     /// # }
     /// ```
     #[must_use]
-    pub fn build_metadata(&self) -> &[String] {
-        &self.build_metadata
+    pub fn build_metadata(&self) -> Option<&str> {
+        self.display.split_once('+').map(|(_, build)| build)
     }
 }
 
@@ -392,7 +412,7 @@ impl FromStr for Version {
             Some((version, build_metadata)) => (version, build_metadata),
             None => (input, ""),
         };
-        let build_metadata = parse_build_metadata(input, build_metadata_part)?;
+        validate_build_metadata(input, build_metadata_part)?;
 
         let (release_part, prerelease_part) = match version_part.split_once('-') {
             Some((_, "")) => {
@@ -452,7 +472,6 @@ impl FromStr for Version {
             display: input.to_owned(),
             release,
             prerelease,
-            build_metadata,
         })
     }
 }
@@ -1069,7 +1088,7 @@ fn parse_comparator(input: &str, part: &str) -> Result<Comparator, ParseError> {
         ));
     }
     let version: Version = version.parse()?;
-    if version.is_prerelease() || !version.build_metadata.is_empty() {
+    if version.is_prerelease() || version.build_metadata().is_some() {
         return Err(ParseError::new(
             input,
             "wildcard versions must not have a prerelease or build metadata",
@@ -1095,12 +1114,12 @@ fn compare_release(left: &[u64], right: &[u64]) -> Ordering {
     Ordering::Equal
 }
 
-fn parse_build_metadata(input: &str, build_metadata_part: &str) -> Result<Vec<String>, ParseError> {
+/// Check that build metadata consists of valid dot-separated identifiers.
+fn validate_build_metadata(input: &str, build_metadata_part: &str) -> Result<(), ParseError> {
     if build_metadata_part.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
-    let mut identifiers = Vec::new();
     for identifier in build_metadata_part.split('.') {
         if identifier.is_empty() {
             return Err(ParseError::new(
@@ -1117,9 +1136,8 @@ fn parse_build_metadata(input: &str, build_metadata_part: &str) -> Result<Vec<St
                 "build metadata identifiers must be ASCII alphanumeric or hyphenated",
             ));
         }
-        identifiers.push(identifier.to_owned());
     }
-    Ok(identifiers)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1177,14 +1195,13 @@ mod tests {
         assert!(build.precedence(&version("1.0")).is_eq());
         assert!(build.precedence(&version("1.0+build.8")).is_eq());
         assert_eq!(build.to_string(), "1.0+build.7");
+        assert_eq!(build.build_metadata(), Some("build.7"));
+        assert_eq!(version("1.0-rc-1+build-2.x").prerelease(), Some("rc-1"));
         assert_eq!(
-            build
-                .build_metadata()
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            vec!["build", "7"]
+            version("1.0-rc-1+build-2.x").build_metadata(),
+            Some("build-2.x")
         );
+        assert_eq!(version(" 05.1+b ").build_metadata(), Some("b"));
 
         assert!(version("1.0-rc.1+build.5") < version("1.0+build.5"));
         assert!(req("==1.0+build.7").matches(&version("1.0+build.8")));

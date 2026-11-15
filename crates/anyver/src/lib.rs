@@ -101,9 +101,9 @@
 //!
 //! A [`Version`] keeps the exact spelling it was parsed from, without surrounding
 //! whitespace, and [`Display`] returns it unchanged. Equality and hashing compare
-//! this spelling, so `5`, `5.0`, and
-//! `5+build.7` are different values, even though they have the same precedence.
-//! [`Ord`] orders by precedence and breaks ties by spelling, which keeps it
+//! this spelling, so `5`, `5.0`, and `5+build.7` are different values, even though
+//! they have the same precedence. [`Version::cmp_precedence`] compares by precedence
+//! alone. [`Ord`] orders by precedence and breaks ties by spelling, which keeps it
 //! consistent with equality. Sorting therefore puts versions in precedence order and
 //! keeps every distinct spelling:
 //!
@@ -119,7 +119,10 @@
 //!     .collect::<Result<_, _>>()?;
 //! let sorted: Vec<String> = versions.iter().map(ToString::to_string).collect();
 //! assert_eq!(sorted, ["0.9", "1.0-rc.1", "1", "1.0"]);
-//! assert_ne!(Version::parse("1")?, Version::parse("1.0")?);
+//!
+//! let (one, one_zero) = (Version::parse("1")?, Version::parse("1.0")?);
+//! assert_ne!(one, one_zero);
+//! assert!(one.cmp_precedence(&one_zero).is_eq());
 //! # Ok(())
 //! # }
 //! ```
@@ -477,8 +480,27 @@ impl FromStr for Version {
 }
 
 impl Version {
-    /// Compare by precedence, ignoring spelling and build metadata.
-    fn precedence(&self, other: &Self) -> Ordering {
+    /// Compare two versions by [precedence](crate#precedence), ignoring their
+    /// spelling and build metadata.
+    ///
+    /// Versions with the same precedence, such as `5`, `5.0`, and `5+build.7`, compare
+    /// as [`Ordering::Equal`]. [`Ord`] orders such versions by spelling.
+    ///
+    /// ```
+    /// use std::cmp::Ordering;
+    ///
+    /// use anyver::Version;
+    ///
+    /// # fn main() -> Result<(), anyver::ParseError> {
+    /// let five = Version::parse("5")?;
+    /// assert_eq!(five.cmp_precedence(&Version::parse("5.0+build.7")?), Ordering::Equal);
+    /// assert_eq!(five.cmp_precedence(&Version::parse("5.1-rc.1")?), Ordering::Less);
+    /// assert_eq!(five.cmp(&Version::parse("5.0")?), Ordering::Less);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn cmp_precedence(&self, other: &Self) -> Ordering {
         match compare_release(&self.release, &other.release) {
             Ordering::Equal => {}
             non_equal => return non_equal,
@@ -509,7 +531,7 @@ impl Hash for Version {
 
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.precedence(other)
+        self.cmp_precedence(other)
             .then_with(|| self.display.cmp(&other.display))
     }
 }
@@ -775,17 +797,17 @@ impl Comparator {
         }
         if self.version.is_prerelease() {
             return match self.op {
-                Operator::Equal => version.precedence(&self.version).is_eq(),
-                Operator::NotEqual => version.precedence(&self.version).is_ne(),
-                Operator::Greater => version.precedence(&self.version).is_gt(),
-                Operator::GreaterEq => version.precedence(&self.version).is_ge(),
-                Operator::Less => version.precedence(&self.version).is_lt(),
-                Operator::LessEq => version.precedence(&self.version).is_le(),
+                Operator::Equal => version.cmp_precedence(&self.version).is_eq(),
+                Operator::NotEqual => version.cmp_precedence(&self.version).is_ne(),
+                Operator::Greater => version.cmp_precedence(&self.version).is_gt(),
+                Operator::GreaterEq => version.cmp_precedence(&self.version).is_ge(),
+                Operator::Less => version.cmp_precedence(&self.version).is_lt(),
+                Operator::LessEq => version.cmp_precedence(&self.version).is_le(),
             };
         }
         match self.op {
-            Operator::Equal => version.precedence(&self.version).is_eq(),
-            Operator::NotEqual => version.precedence(&self.version).is_ne(),
+            Operator::Equal => version.cmp_precedence(&self.version).is_eq(),
+            Operator::NotEqual => version.cmp_precedence(&self.version).is_ne(),
             Operator::GreaterEq => self.compare_start(version) != Ordering::Less,
             Operator::Less => self.compare_start(version) == Ordering::Less,
             Operator::Greater => self.compare_line(version) == Ordering::Greater,
@@ -1146,9 +1168,13 @@ mod tests {
 
     #[test]
     fn trailing_release_zeroes_do_not_affect_precedence() {
-        assert!(version("5").precedence(&version("5.0")).is_eq());
-        assert!(version("5.0").precedence(&version("5.0.0")).is_eq());
-        assert!(version("05.002.000").precedence(&version("5.2")).is_eq());
+        assert!(version("5").cmp_precedence(&version("5.0")).is_eq());
+        assert!(version("5.0").cmp_precedence(&version("5.0.0")).is_eq());
+        assert!(
+            version("05.002.000")
+                .cmp_precedence(&version("5.2"))
+                .is_eq()
+        );
         assert!(req("==5").matches(&version("5.0.0")));
         assert_eq!(version("5.0.0").to_string(), "5.0.0");
         assert_eq!(version("2026.05.12").to_string(), "2026.05.12");
@@ -1178,10 +1204,10 @@ mod tests {
 
     #[test]
     fn numeric_prerelease_leading_zeroes_do_not_affect_precedence() {
-        assert!(version("1.0-01").precedence(&version("1.0-1")).is_eq());
+        assert!(version("1.0-01").cmp_precedence(&version("1.0-1")).is_eq());
         assert!(
             version("1.0-alpha.01")
-                .precedence(&version("1.0-alpha.1"))
+                .cmp_precedence(&version("1.0-alpha.1"))
                 .is_eq()
         );
         assert!(req("==1.0-1").matches(&version("1.0-01")));
@@ -1192,8 +1218,8 @@ mod tests {
     #[test]
     fn supports_build_metadata_ignored_for_compatibility() {
         let build = version("1.0+build.7");
-        assert!(build.precedence(&version("1.0")).is_eq());
-        assert!(build.precedence(&version("1.0+build.8")).is_eq());
+        assert!(build.cmp_precedence(&version("1.0")).is_eq());
+        assert!(build.cmp_precedence(&version("1.0+build.8")).is_eq());
         assert_eq!(build.to_string(), "1.0+build.7");
         assert_eq!(build.build_metadata(), Some("build.7"));
         assert_eq!(version("1.0-rc-1+build-2.x").prerelease(), Some("rc-1"));
@@ -1212,7 +1238,7 @@ mod tests {
     fn leading_zeroes_and_build_metadata_do_not_affect_matching() {
         assert!(req("==5.1-rc.1").matches(&version("05.1-rc.01")));
         assert!(req("==1").matches(&version("1.0+build.7")));
-        assert!(version("1-01a").precedence(&version("1-1a")).is_lt());
+        assert!(version("1-01a").cmp_precedence(&version("1-1a")).is_lt());
     }
 
     #[test]

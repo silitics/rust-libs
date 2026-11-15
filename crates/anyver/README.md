@@ -20,8 +20,8 @@ assert!(Version::parse("20260625071935")? > Version::parse("20260624235959")?);
 ```
 
 Requirements are designed for checking whether installed components fit together. `>=3,<4`
-matches every version of the 3 line, including the release candidate `3.0-rc.1`, but not
-`4.0-rc.1`, which already belongs to the next line.
+matches every 3.x version, including the release candidate `3.0-rc.1`, but not `4.0-rc.1`,
+which already contains the changes of version 4.
 
 The [documentation](https://docs.rs/anyver) defines the version grammar, the ordering, and
 the requirement rules in detail. Enable the `serde` feature to serialize versions and

@@ -9,7 +9,6 @@ repository = "https://github.com/silitics/rust-libs/"
 
 [workspace.dependencies]
 console = "0.16.4"
-proptest = "1.12.0"
 serde_json = "1.0.150"
 tracing = "0.1.44"
 

@@ -62,7 +62,8 @@
 //! as in `v1.2`, is not part of the grammar. Debian versions use `~` for prereleases
 //! and `-` for package revisions. To convert `1:2.27~rc1-3`, for example, replace `~`
 //! with `-`, keep the package revision as build metadata, and drop the epoch `1:`,
-//! which gives `2.27-rc1+3`.
+//! which gives `2.27-rc1+3`. Dropping the epoch is only safe if all compared versions
+//! share it.
 //!
 //! ## Precedence
 //!
@@ -136,10 +137,8 @@
 //! as in `>=2.20`. The operators are `==`, `!=`, `>`, `>=`, `<`, and `<=`, and `=` is
 //! an alias for `==`. A version without an operator, such as `2.20`, means `==2.20`.
 //! The requirement `*` matches every version. Cargo and npm shorthands such as `^`
-//! and `~` are not supported, because they presume a scheme.
-//!
-//! Matching ignores how the matched version is spelled, so `==1` matches `1.0` and
-//! `1.0+build.7`.
+//! and `~` are not supported, because they presume a scheme. Matching ignores how
+//! the matched version is spelled, so `==1` matches `1.0` and `1.0+build.7`.
 //!
 //! ## Lines
 //!
@@ -171,11 +170,12 @@
 //! For `>` and `<=`, appending zero release components narrows the line: `>3` does
 //! not match `3.1`, but `>3.0` does. For `>=` and `<`, appending zero release
 //! components changes nothing, because it does not move where the line starts, so
-//! `>=3` and `>=3.0` match the same versions. `==` and `!=` ignore
-//! lines and compare precedence, so `==3`, or just `3`, pins version 3 however it is
-//! spelled.
-//! Wildcards, such as `3.*`, are only allowed with `=`, `==`, and `!=`, and their
-//! version must not have a prerelease or build metadata.
+//! `>=3` and `>=3.0` match the same versions.
+//!
+//! `==` and `!=` ignore lines and compare precedence, so `==3`, or just `3`, pins
+//! version 3 however it is spelled. Wildcards, such as `3.*`, are only allowed with
+//! `=`, `==`, and `!=`, and their version must not have a prerelease or build
+//! metadata.
 //!
 //! A comparator whose version has a prerelease compares by precedence. For
 //! example, `>=3-rc.2` matches `3-rc.2`, `3`, and every later version, but not
@@ -186,7 +186,7 @@
 //! use anyver::{Version, VersionReq};
 //!
 //! # fn main() -> Result<(), anyver::ParseError> {
-//! let v = |input: &str| Version::parse(input);
+//! let v = Version::parse;
 //!
 //! let line = VersionReq::parse(">=3,<4")?;
 //! assert!(line.matches(&v("3.0-rc.1")?));
@@ -231,10 +231,9 @@
 //!
 //! # Serde
 //!
-//! With the `serde` feature, [`Version`], [`VersionReq`],
-//! [`Comparator`], and [`Operator`] serialize as strings. Deserialization applies the
-//! same grammar as parsing, so invalid versions are rejected when the surrounding
-//! document is read:
+//! With the `serde` feature, [`Version`], [`VersionReq`], [`Comparator`], and
+//! [`Operator`] serialize as strings. Deserialization applies the same grammar as
+//! parsing, so invalid versions are rejected when the surrounding document is read:
 //!
 //! ```
 //! # #[cfg(feature = "serde")]
@@ -263,18 +262,12 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::cmp::Ordering;
-use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
+use std::{fmt, iter};
 
 #[cfg(feature = "serde")]
-use serde::Deserialize;
-#[cfg(feature = "serde")]
-use serde::Deserializer;
-#[cfg(feature = "serde")]
-use serde::Serialize;
-#[cfg(feature = "serde")]
-use serde::Serializer;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A version, such as `1.4.2`, `2026.06.25`, or `2.0.0-rc.1+build.7`.
 ///
@@ -299,8 +292,11 @@ use serde::Serializer;
 /// ```
 #[derive(Debug, Clone)]
 pub struct Version {
-    display: String,
+    /// The version as spelled, without surrounding whitespace.
+    spelling: String,
+    /// The release components, including trailing zeros.
     release: Vec<u64>,
+    /// The prerelease identifiers, empty for a release.
     prerelease: Vec<PrereleaseIdentifier>,
 }
 
@@ -360,11 +356,7 @@ impl Version {
     /// ```
     #[must_use]
     pub fn prerelease(&self) -> Option<&str> {
-        let version = self
-            .display
-            .split_once('+')
-            .map_or(self.display.as_str(), |(v, _)| v);
-        version.split_once('-').map(|(_, prerelease)| prerelease)
+        split_version(&self.spelling).1
     }
 
     /// Whether this version has a prerelease, such as `rc.1` in `2.0.0-rc.1`.
@@ -398,90 +390,9 @@ impl Version {
     /// ```
     #[must_use]
     pub fn build_metadata(&self) -> Option<&str> {
-        self.display.split_once('+').map(|(_, build)| build)
+        split_version(&self.spelling).2
     }
-}
 
-impl FromStr for Version {
-    type Err = ParseError;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let input = input.trim();
-        if input.is_empty() {
-            return Err(ParseError::new(input, "version must not be empty"));
-        }
-        let (version_part, build_metadata_part) = match input.split_once('+') {
-            Some((_, "")) => {
-                return Err(ParseError::new(input, "build metadata must not be empty"));
-            }
-            Some((version, build_metadata)) => (version, build_metadata),
-            None => (input, ""),
-        };
-        validate_build_metadata(input, build_metadata_part)?;
-
-        let (release_part, prerelease_part) = match version_part.split_once('-') {
-            Some((_, "")) => {
-                return Err(ParseError::new(input, "prerelease part must not be empty"));
-            }
-            Some((release, prerelease)) => (release, prerelease),
-            None => (version_part, ""),
-        };
-        if release_part.is_empty() {
-            return Err(ParseError::new(input, "release part must not be empty"));
-        }
-
-        let mut release = Vec::new();
-        for component in release_part.split('.') {
-            if component.is_empty() {
-                return Err(ParseError::new(
-                    input,
-                    "release components must not be empty",
-                ));
-            }
-            if !component.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(ParseError::new(input, "release components must be numeric"));
-            }
-            release.push(
-                component.parse::<u64>().map_err(|_| {
-                    ParseError::new(input, "release component does not fit into u64")
-                })?,
-            );
-        }
-
-        let prerelease = if prerelease_part.is_empty() {
-            Vec::new()
-        } else {
-            let mut identifiers = Vec::new();
-            for identifier in prerelease_part.split('.') {
-                if identifier.is_empty() {
-                    return Err(ParseError::new(
-                        input,
-                        "prerelease identifiers must not be empty",
-                    ));
-                }
-                if !identifier
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                {
-                    return Err(ParseError::new(
-                        input,
-                        "prerelease identifiers must be ASCII alphanumeric or hyphenated",
-                    ));
-                }
-                identifiers.push(PrereleaseIdentifier::parse(identifier, input)?);
-            }
-            identifiers
-        };
-
-        Ok(Self {
-            display: input.to_owned(),
-            release,
-            prerelease,
-        })
-    }
-}
-
-impl Version {
     /// Compare two versions by [precedence](crate#precedence), ignoring their
     /// spelling and build metadata.
     ///
@@ -503,23 +414,57 @@ impl Version {
     /// ```
     #[must_use]
     pub fn cmp_precedence(&self, other: &Self) -> Ordering {
-        match compare_release(&self.release, &other.release) {
-            Ordering::Equal => {}
-            non_equal => return non_equal,
-        }
+        compare_release(&self.release, &other.release).then_with(|| {
+            match (self.is_prerelease(), other.is_prerelease()) {
+                (false, false) => Ordering::Equal,
+                (false, true) => Ordering::Greater,
+                (true, false) => Ordering::Less,
+                (true, true) => self.prerelease.cmp(&other.prerelease),
+            }
+        })
+    }
+}
 
-        match (self.prerelease.is_empty(), other.prerelease.is_empty()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => Ordering::Greater,
-            (false, true) => Ordering::Less,
-            (false, false) => self.prerelease.cmp(&other.prerelease),
+impl FromStr for Version {
+    type Err = ParseError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let input = input.trim();
+        if input.is_empty() {
+            return Err(ParseError::new(input, "version must not be empty"));
         }
+        let (release, prerelease, build_metadata) = split_version(input);
+        if release.is_empty() {
+            return Err(ParseError::new(input, "release must not be empty"));
+        }
+        let release = release
+            .split('.')
+            .map(|component| parse_release_component(input, component))
+            .collect::<Result<_, _>>()?;
+        let prerelease = match prerelease {
+            Some(prerelease) => {
+                validate_identifiers(input, prerelease, Part::Prerelease)?;
+                prerelease
+                    .split('.')
+                    .map(|identifier| PrereleaseIdentifier::parse(input, identifier))
+                    .collect::<Result<_, _>>()?
+            }
+            None => Vec::new(),
+        };
+        if let Some(build_metadata) = build_metadata {
+            validate_identifiers(input, build_metadata, Part::BuildMetadata)?;
+        }
+        Ok(Self {
+            spelling: input.to_owned(),
+            release,
+            prerelease,
+        })
     }
 }
 
 impl PartialEq for Version {
     fn eq(&self, other: &Self) -> bool {
-        self.display == other.display
+        self.spelling == other.spelling
     }
 }
 
@@ -527,14 +472,14 @@ impl Eq for Version {}
 
 impl Hash for Version {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.display.hash(state);
+        self.spelling.hash(state);
     }
 }
 
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> Ordering {
         self.cmp_precedence(other)
-            .then_with(|| self.display.cmp(&other.display))
+            .then_with(|| self.spelling.cmp(&other.spelling))
     }
 }
 
@@ -546,28 +491,21 @@ impl PartialOrd for Version {
 
 impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.display)
+        f.write_str(&self.spelling)
     }
 }
 
 #[cfg(feature = "serde")]
 impl Serialize for Version {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.display)
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.spelling)
     }
 }
 
 #[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for Version {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let input = String::deserialize(deserializer)?;
-        Self::parse(&input).map_err(serde::de::Error::custom)
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_from_str(deserializer)
     }
 }
 
@@ -720,24 +658,18 @@ impl FromStr for VersionReq {
             return Ok(Self::any());
         }
         if input.is_empty() {
-            return Err(ParseError::new(
-                input,
-                "version requirement must not be empty",
-            ));
+            return Err(ParseError::new(input, "requirement must not be empty"));
         }
-
-        let mut comparators = Vec::new();
-        for part in input.split(',') {
-            let part = part.trim();
-            if part.is_empty() {
-                return Err(ParseError::new(
-                    input,
-                    "version requirement contains an empty comparator",
-                ));
-            }
-            comparators.push(parse_comparator(input, part)?);
-        }
-        Ok(Self { comparators })
+        input
+            .split(',')
+            .map(|comparator| {
+                let comparator = comparator.trim();
+                if comparator.is_empty() {
+                    return Err(ParseError::new(input, "comparators must not be empty"));
+                }
+                comparator.parse()
+            })
+            .collect()
     }
 }
 
@@ -758,22 +690,15 @@ impl fmt::Display for VersionReq {
 
 #[cfg(feature = "serde")]
 impl Serialize for VersionReq {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_str(self)
     }
 }
 
 #[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for VersionReq {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let input = String::deserialize(deserializer)?;
-        Self::parse(&input).map_err(serde::de::Error::custom)
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_from_str(deserializer)
     }
 }
 
@@ -869,30 +794,21 @@ impl Comparator {
     #[must_use]
     pub fn matches(&self, version: &Version) -> bool {
         if self.wildcard {
-            let in_line = self.compare_line(version) == Ordering::Equal;
-            return if self.op == Operator::NotEqual {
-                !in_line
-            } else {
-                in_line
-            };
+            let in_line = self.compare_line(version).is_eq();
+            return in_line == (self.op == Operator::Equal);
         }
-        if self.version.is_prerelease() {
-            return match self.op {
-                Operator::Equal => version.cmp_precedence(&self.version).is_eq(),
-                Operator::NotEqual => version.cmp_precedence(&self.version).is_ne(),
-                Operator::Greater => version.cmp_precedence(&self.version).is_gt(),
-                Operator::GreaterEq => version.cmp_precedence(&self.version).is_ge(),
-                Operator::Less => version.cmp_precedence(&self.version).is_lt(),
-                Operator::LessEq => version.cmp_precedence(&self.version).is_le(),
-            };
-        }
-        match self.op {
-            Operator::Equal => version.cmp_precedence(&self.version).is_eq(),
-            Operator::NotEqual => version.cmp_precedence(&self.version).is_ne(),
-            Operator::GreaterEq => self.compare_start(version) != Ordering::Less,
-            Operator::Less => self.compare_start(version) == Ordering::Less,
-            Operator::Greater => self.compare_line(version) == Ordering::Greater,
-            Operator::LessEq => self.compare_line(version) != Ordering::Greater,
+        let precedence = || version.cmp_precedence(&self.version);
+        match (self.op, self.version.is_prerelease()) {
+            (Operator::Equal, _) => precedence().is_eq(),
+            (Operator::NotEqual, _) => precedence().is_ne(),
+            (Operator::Greater, true) => precedence().is_gt(),
+            (Operator::GreaterEq, true) => precedence().is_ge(),
+            (Operator::Less, true) => precedence().is_lt(),
+            (Operator::LessEq, true) => precedence().is_le(),
+            (Operator::Greater, false) => self.compare_line(version).is_gt(),
+            (Operator::GreaterEq, false) => self.compare_start(version).is_ge(),
+            (Operator::Less, false) => self.compare_start(version).is_lt(),
+            (Operator::LessEq, false) => self.compare_line(version).is_le(),
         }
     }
 
@@ -907,15 +823,9 @@ impl Comparator {
     ///
     /// Only as many release components count as the comparator's version spells.
     fn compare_line(&self, version: &Version) -> Ordering {
-        version
-            .release
-            .iter()
-            .copied()
-            .chain(std::iter::repeat(0))
-            .zip(&self.version.release)
-            .map(|(left, right)| left.cmp(right))
-            .find(|ordering| ordering.is_ne())
-            .unwrap_or(Ordering::Equal)
+        padded(&version.release)
+            .take(self.version.release.len())
+            .cmp(self.version.release.iter().copied())
     }
 }
 
@@ -923,11 +833,38 @@ impl FromStr for Comparator {
     type Err = ParseError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
+        const OPERATORS: [(&str, Operator); 7] = [
+            (">=", Operator::GreaterEq),
+            ("<=", Operator::LessEq),
+            ("==", Operator::Equal),
+            ("!=", Operator::NotEqual),
+            (">", Operator::Greater),
+            ("<", Operator::Less),
+            ("=", Operator::Equal),
+        ];
         let input = input.trim();
-        if input.is_empty() {
-            return Err(ParseError::new(input, "comparator must not be empty"));
+        let (op, version) = OPERATORS
+            .iter()
+            .find_map(|(symbol, op)| input.strip_prefix(symbol).map(|rest| (*op, rest.trim())))
+            .unwrap_or((Operator::Equal, input));
+        if version.is_empty() {
+            return Err(ParseError::new(input, "comparator is missing a version"));
         }
-        parse_comparator(input, input)
+        let Some(version) = version.strip_suffix(".*") else {
+            return Ok(Self::new(op, version.parse()?));
+        };
+        if !matches!(op, Operator::Equal | Operator::NotEqual) {
+            return Err(ParseError::new(
+                input,
+                "wildcards are only allowed with `==` and `!=`",
+            ));
+        }
+        Self::wildcard(op, version.parse()?).ok_or_else(|| {
+            ParseError::new(
+                input,
+                "wildcard versions must not have a prerelease or build metadata",
+            )
+        })
     }
 }
 
@@ -943,22 +880,15 @@ impl fmt::Display for Comparator {
 
 #[cfg(feature = "serde")]
 impl Serialize for Comparator {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_str(self)
     }
 }
 
 #[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for Comparator {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let input = String::deserialize(deserializer)?;
-        input.parse().map_err(serde::de::Error::custom)
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_from_str(deserializer)
     }
 }
 
@@ -999,10 +929,7 @@ impl FromStr for Operator {
             ">=" => Ok(Self::GreaterEq),
             "<" => Ok(Self::Less),
             "<=" => Ok(Self::LessEq),
-            _ => Err(ParseError::new(
-                input,
-                "unknown version comparator operator",
-            )),
+            _ => Err(ParseError::new(input, "unknown operator")),
         }
     }
 }
@@ -1022,22 +949,15 @@ impl fmt::Display for Operator {
 
 #[cfg(feature = "serde")]
 impl Serialize for Operator {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_str(self)
     }
 }
 
 #[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for Operator {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let input = String::deserialize(deserializer)?;
-        input.parse().map_err(serde::de::Error::custom)
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_from_str(deserializer)
     }
 }
 
@@ -1048,14 +968,14 @@ impl<'de> Deserialize<'de> for Operator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
     input: String,
-    message: String,
+    message: &'static str,
 }
 
 impl ParseError {
-    fn new(input: impl Into<String>, message: impl Into<String>) -> Self {
+    fn new(input: &str, message: &'static str) -> Self {
         Self {
-            input: input.into(),
-            message: message.into(),
+            input: input.to_owned(),
+            message,
         }
     }
 
@@ -1071,7 +991,7 @@ impl ParseError {
     /// What is wrong with the input, such as `release components must be numeric`.
     #[must_use]
     pub fn message(&self) -> &str {
-        &self.message
+        self.message
     }
 }
 
@@ -1083,147 +1003,75 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// A prerelease identifier.
-#[derive(Debug, Clone)]
+/// One prerelease identifier.
+///
+/// The variant order makes numeric identifiers precede alphanumeric ones.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum PrereleaseIdentifier {
-    Numeric { value: u64, display: String },
-    Alpha(String),
+    Numeric(u64),
+    Alphanumeric(String),
 }
 
 impl PrereleaseIdentifier {
-    fn parse(input: &str, version: &str) -> Result<Self, ParseError> {
-        if input.bytes().all(|b| b.is_ascii_digit()) {
-            Ok(Self::Numeric {
-                value: input.parse::<u64>().map_err(|_| {
-                    ParseError::new(version, "prerelease number does not fit into u64")
-                })?,
-                display: input.to_owned(),
-            })
-        } else {
-            Ok(Self::Alpha(input.to_owned()))
+    /// Parse an identifier that has already been checked for valid characters.
+    fn parse(input: &str, identifier: &str) -> Result<Self, ParseError> {
+        if !identifier.bytes().all(|b| b.is_ascii_digit()) {
+            return Ok(Self::Alphanumeric(identifier.to_owned()));
         }
-    }
-}
-
-impl PartialEq for PrereleaseIdentifier {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Numeric { value: left, .. }, Self::Numeric { value: right, .. }) => {
-                left == right
-            }
-            (Self::Alpha(left), Self::Alpha(right)) => left == right,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for PrereleaseIdentifier {}
-
-impl Hash for PrereleaseIdentifier {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            Self::Numeric { value, .. } => {
-                0_u8.hash(state);
-                value.hash(state);
-            }
-            Self::Alpha(value) => {
-                1_u8.hash(state);
-                value.hash(state);
-            }
-        }
-    }
-}
-
-impl Ord for PrereleaseIdentifier {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match (self, other) {
-            (Self::Numeric { value: left, .. }, Self::Numeric { value: right, .. }) => {
-                left.cmp(right)
-            }
-            (Self::Numeric { .. }, Self::Alpha(_)) => Ordering::Less,
-            (Self::Alpha(_), Self::Numeric { .. }) => Ordering::Greater,
-            (Self::Alpha(left), Self::Alpha(right)) => left.cmp(right),
-        }
-    }
-}
-
-impl PartialOrd for PrereleaseIdentifier {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl fmt::Display for PrereleaseIdentifier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Numeric { display, .. } => f.write_str(display),
-            Self::Alpha(value) => f.write_str(value),
-        }
-    }
-}
-
-fn parse_comparator(input: &str, part: &str) -> Result<Comparator, ParseError> {
-    const OPERATORS: &[(&str, Operator)] = &[
-        (">=", Operator::GreaterEq),
-        ("<=", Operator::LessEq),
-        ("==", Operator::Equal),
-        ("!=", Operator::NotEqual),
-        (">", Operator::Greater),
-        ("<", Operator::Less),
-        ("=", Operator::Equal),
-    ];
-
-    let (op, version) = OPERATORS
-        .iter()
-        .find_map(|(prefix, op)| {
-            part.strip_prefix(prefix)
-                .map(|version| (*op, version.trim()))
+        identifier.parse().map(Self::Numeric).map_err(|_| {
+            ParseError::new(input, "numeric prerelease identifiers must fit into a u64")
         })
-        .unwrap_or((Operator::Equal, part));
-    if version.is_empty() {
-        return Err(ParseError::new(input, "comparator is missing a version"));
     }
-    let Some(version) = version.strip_suffix(".*") else {
-        return Ok(Comparator::new(op, version.parse()?));
+}
+
+/// Split a version into its release, prerelease, and build metadata.
+///
+/// The release cannot contain `-` or `+`, and the prerelease cannot contain `+`, so the
+/// first `+` starts the build metadata and the first `-` before it starts the prerelease.
+fn split_version(version: &str) -> (&str, Option<&str>, Option<&str>) {
+    let (version, build_metadata) = match version.split_once('+') {
+        Some((version, build_metadata)) => (version, Some(build_metadata)),
+        None => (version, None),
     };
-    if !matches!(op, Operator::Equal | Operator::NotEqual) {
+    match version.split_once('-') {
+        Some((release, prerelease)) => (release, Some(prerelease), build_metadata),
+        None => (version, None, build_metadata),
+    }
+}
+
+/// Parse one release component.
+fn parse_release_component(input: &str, component: &str) -> Result<u64, ParseError> {
+    if component.is_empty() {
         return Err(ParseError::new(
             input,
-            "wildcards are only allowed with `==` and `!=`",
+            "release components must not be empty",
         ));
     }
-    Comparator::wildcard(op, version.parse()?).ok_or_else(|| {
-        ParseError::new(
-            input,
-            "wildcard versions must not have a prerelease or build metadata",
-        )
-    })
+    if !component.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ParseError::new(input, "release components must be numeric"));
+    }
+    component
+        .parse()
+        .map_err(|_| ParseError::new(input, "release components must fit into a u64"))
 }
 
-fn compare_release(left: &[u64], right: &[u64]) -> Ordering {
-    let max_len = left.len().max(right.len());
-    for idx in 0..max_len {
-        let left = left.get(idx).copied().unwrap_or(0);
-        let right = right.get(idx).copied().unwrap_or(0);
-        match left.cmp(&right) {
-            Ordering::Equal => {}
-            non_equal => return non_equal,
-        }
-    }
-    Ordering::Equal
+/// A part of a version that consists of dot-separated identifiers.
+#[derive(Clone, Copy)]
+enum Part {
+    Prerelease,
+    BuildMetadata,
 }
 
-/// Check that build metadata consists of valid dot-separated identifiers.
-fn validate_build_metadata(input: &str, build_metadata_part: &str) -> Result<(), ParseError> {
-    if build_metadata_part.is_empty() {
-        return Ok(());
-    }
-
-    for identifier in build_metadata_part.split('.') {
+/// Check that a prerelease or build metadata consists of valid identifiers.
+fn validate_identifiers(input: &str, identifiers: &str, part: Part) -> Result<(), ParseError> {
+    for identifier in identifiers.split('.') {
         if identifier.is_empty() {
             return Err(ParseError::new(
                 input,
-                "build metadata identifiers must not be empty",
+                match part {
+                    Part::Prerelease => "prerelease identifiers must not be empty",
+                    Part::BuildMetadata => "build metadata identifiers must not be empty",
+                },
             ));
         }
         if !identifier
@@ -1232,460 +1080,484 @@ fn validate_build_metadata(input: &str, build_metadata_part: &str) -> Result<(),
         {
             return Err(ParseError::new(
                 input,
-                "build metadata identifiers must be ASCII alphanumeric or hyphenated",
+                match part {
+                    Part::Prerelease => {
+                        "prerelease identifiers must consist of ASCII letters, digits, and hyphens"
+                    }
+                    Part::BuildMetadata => {
+                        "build metadata identifiers must consist of ASCII letters, digits, and \
+                         hyphens"
+                    }
+                },
             ));
         }
     }
     Ok(())
 }
 
+/// Release components followed by infinitely many zeros.
+fn padded(release: &[u64]) -> impl Iterator<Item = u64> + '_ {
+    release.iter().copied().chain(iter::repeat(0))
+}
+
+/// Compare release components, padding the shorter one with zeros.
+fn compare_release(left: &[u64], right: &[u64]) -> Ordering {
+    let len = left.len().max(right.len());
+    padded(left).take(len).cmp(padded(right).take(len))
+}
+
+/// Deserialize a value from a string through its [`FromStr`] implementation.
+#[cfg(feature = "serde")]
+fn deserialize_from_str<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr<Err = ParseError>,
+{
+    let input = String::deserialize(deserializer)?;
+    input.parse().map_err(serde::de::Error::custom)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+    use std::collections::{BTreeSet, HashSet};
+
     use super::*;
 
+    /// Versions of the schemes the grammar covers parse and keep their spelling.
     #[test]
-    fn trailing_release_zeroes_do_not_affect_precedence() {
-        assert!(version("5").cmp_precedence(&version("5.0")).is_eq());
-        assert!(version("5.0").cmp_precedence(&version("5.0.0")).is_eq());
-        assert!(
-            version("05.002.000")
-                .cmp_precedence(&version("5.2"))
-                .is_eq()
-        );
-        assert!(req("==5").matches(&version("5.0.0")));
-        assert_eq!(version("5.0.0").to_string(), "5.0.0");
-        assert_eq!(version("2026.05.12").to_string(), "2026.05.12");
+    fn parses_versions_of_common_schemes() {
+        for input in [
+            "1.4.2",
+            "2.0.0-rc.1",
+            "1.4.2+build.7",
+            "2026.6",
+            "2026.06.25",
+            "24.04",
+            "42",
+            "20260625071935",
+            "2026.6.25.2",
+            "1.0--",
+            "1.0-alpha-1+build-2.x",
+            "18446744073709551615",
+            "1-18446744073709551615",
+            "1+18446744073709551616",
+        ] {
+            assert_eq!(version(input).to_string(), input);
+        }
+        assert_eq!(version(" 5.2 ").to_string(), "5.2");
     }
 
+    /// Parsing rejects inputs outside the grammar with a message naming the problem.
     #[test]
-    fn orders_numeric_release_components() {
-        assert!(version("5.10") > version("5.2"));
-        assert!(version("5.2.1") > version("5.2"));
-        assert!(version("6") > version("5.99.99"));
+    fn rejects_invalid_versions() {
+        for (input, message) in [
+            ("", "version must not be empty"),
+            ("-rc.1", "release must not be empty"),
+            ("1..2", "release components must not be empty"),
+            ("1.", "release components must not be empty"),
+            ("1.x", "release components must be numeric"),
+            ("v1.2", "release components must be numeric"),
+            (
+                "18446744073709551616",
+                "release components must fit into a u64",
+            ),
+            ("1-", "prerelease identifiers must not be empty"),
+            ("1.0-alpha..1", "prerelease identifiers must not be empty"),
+            (
+                "1.0-alpha_1",
+                "prerelease identifiers must consist of ASCII letters, digits, and hyphens",
+            ),
+            (
+                "1-18446744073709551616",
+                "numeric prerelease identifiers must fit into a u64",
+            ),
+            ("1.0+", "build metadata identifiers must not be empty"),
+            (
+                "1.0+build..1",
+                "build metadata identifiers must not be empty",
+            ),
+            (
+                "1.0+build+1",
+                "build metadata identifiers must consist of ASCII letters, digits, and hyphens",
+            ),
+            ("1:2.27~rc1-3", "release components must be numeric"),
+        ] {
+            let error = Version::parse(input).err();
+            assert_eq!(
+                error.as_ref().map(ParseError::message),
+                Some(message),
+                "{input:?}"
+            );
+        }
     }
 
+    /// The accessors return the parts of a version as spelled.
     #[test]
-    fn orders_prerelease_before_final_release() {
-        assert!(version("1.0.0-rc.1") < version("1.0.0"));
-        assert!(version("1.0.0-alpha") < version("1.0.0-beta"));
-        assert!(version("1.0.0-alpha.2") < version("1.0.0-alpha.10"));
+    fn returns_version_parts() {
+        let parsed = version("05.2.0-rc-1.01+build-2.x");
+        assert_eq!(parsed.release(), [5, 2, 0]);
+        assert_eq!(parsed.prerelease(), Some("rc-1.01"));
+        assert!(parsed.is_prerelease());
+        assert_eq!(parsed.build_metadata(), Some("build-2.x"));
+
+        let release = version("5+b");
+        assert_eq!(release.prerelease(), None);
+        assert!(!release.is_prerelease());
+        assert_eq!(release.build_metadata(), Some("b"));
+        assert_eq!(version("5").build_metadata(), None);
     }
 
+    /// Precedence follows the four rules of the crate documentation.
     #[test]
-    fn follows_semver_prerelease_separators_and_ordering() {
-        assert!(Version::parse("1.0--").is_ok());
-        assert!(version("1.0-dev.0.rc.5") < version("1.0-dev.0-rc.5"));
-        assert!(version("1.0-RC") < version("1.0-rc"));
-        assert_ne!(version("1.0-RC"), version("1.0-rc"));
+    fn orders_versions_by_precedence() {
+        let ordered = [
+            "0.9",
+            "1.0-0",
+            "1.0-1",
+            "1.0-2",
+            "1.0-10",
+            "1.0-RC",
+            "1.0-alpha",
+            "1.0-alpha.1",
+            "1.0-alpha.beta",
+            "1.0-alpha10",
+            "1.0-alpha9",
+            "1.0-beta",
+            "1.0-beta.2",
+            "1.0-beta.11",
+            "1.0-rc",
+            "1.0-rc.1",
+            "1.0",
+            "1.0.1",
+            "1.1",
+            "1.9",
+            "1.10",
+            "2",
+        ];
+        for pair in ordered.windows(2) {
+            let ordering = version(pair[0]).cmp_precedence(&version(pair[1]));
+            assert_eq!(ordering, Ordering::Less, "{} < {}", pair[0], pair[1]);
+        }
     }
 
+    /// Trailing zeros, leading zeros, and build metadata do not affect precedence.
     #[test]
-    fn numeric_prerelease_leading_zeroes_do_not_affect_precedence() {
-        assert!(version("1.0-01").cmp_precedence(&version("1.0-1")).is_eq());
-        assert!(
-            version("1.0-alpha.01")
-                .cmp_precedence(&version("1.0-alpha.1"))
-                .is_eq()
-        );
-        assert!(req("==1.0-1").matches(&version("1.0-01")));
-        assert_eq!(version("1.0-01").to_string(), "1.0-01");
-        assert_eq!(version("1.0-alpha.01").to_string(), "1.0-alpha.01");
-    }
-
-    #[test]
-    fn supports_build_metadata_ignored_for_compatibility() {
-        let build = version("1.0+build.7");
-        assert!(build.cmp_precedence(&version("1.0")).is_eq());
-        assert!(build.cmp_precedence(&version("1.0+build.8")).is_eq());
-        assert_eq!(build.to_string(), "1.0+build.7");
-        assert_eq!(build.build_metadata(), Some("build.7"));
-        assert_eq!(version("1.0-rc-1+build-2.x").prerelease(), Some("rc-1"));
-        assert_eq!(
-            version("1.0-rc-1+build-2.x").build_metadata(),
-            Some("build-2.x")
-        );
-        assert_eq!(version(" 05.1+b ").build_metadata(), Some("b"));
-
-        assert!(version("1.0-rc.1+build.5") < version("1.0+build.5"));
-        assert!(req("==1.0+build.7").matches(&version("1.0+build.8")));
-        assert!(req("==1.0").matches(&version("1.0+build.7")));
-    }
-
-    #[test]
-    fn leading_zeroes_and_build_metadata_do_not_affect_matching() {
-        assert!(req("==5.1-rc.1").matches(&version("05.1-rc.01")));
-        assert!(req("==1").matches(&version("1.0+build.7")));
+    fn ignores_zeros_and_build_metadata_in_precedence() {
+        for (left, right) in [
+            ("5", "5.0"),
+            ("5", "5.0.0"),
+            ("05.002", "5.2"),
+            ("1.0-01", "1.0-1"),
+            ("1.0-alpha.01", "1.0-alpha.1"),
+            ("1.0+build.7", "1.0"),
+            ("1.0+build.7", "1.0+build.8"),
+        ] {
+            let ordering = version(left).cmp_precedence(&version(right));
+            assert_eq!(ordering, Ordering::Equal, "{left} = {right}");
+        }
+        // Leading zeros of alphanumeric identifiers are significant.
         assert!(version("1-01a").cmp_precedence(&version("1-1a")).is_lt());
     }
 
+    /// Equality and hashing compare spelling, and `Ord` breaks precedence ties by it.
     #[test]
-    fn any_requirement_is_only_star() {
-        assert!(req("*").is_any());
-        assert!(!req(">=0").is_any());
-        assert_eq!(VersionReq::any().to_string(), "*");
-        assert_eq!(req(" = 5 , >3-rc.1 ").to_string(), "==5,>3-rc.1");
-    }
-
-    #[test]
-    fn operators_ignore_surrounding_whitespace() {
-        assert_eq!(" >= ".parse::<Operator>(), Ok(Operator::GreaterEq));
-        let error = " => ".parse::<Operator>().err();
-        assert_eq!(error.as_ref().map(ParseError::input), Some("=>"));
-    }
-
-    #[test]
-    fn requirement_errors_report_the_failing_part() {
-        let error = VersionReq::parse(">=3,==x").err();
-        assert_eq!(error.as_ref().map(ParseError::input), Some("x"));
-    }
-
-    #[test]
-    fn equality_and_hashing_use_spelling() {
-        use std::collections::{BTreeSet, HashSet};
-
+    fn compares_identity_by_spelling() {
         assert_eq!(version("5.0"), version(" 5.0 "));
-        assert_ne!(version("5"), version("5.0"));
-        assert_ne!(version("05"), version("5"));
-        assert_ne!(version("1.0+build.7"), version("1.0+build.8"));
+        for (left, right) in [("5", "5.0"), ("05", "5"), ("1+b.7", "1+b.8")] {
+            assert_ne!(version(left), version(right), "{left} != {right}");
+        }
 
-        let spellings = ["1.0+build.7", "1.0+build.8", "1.0", "1", "1.0+build.7"];
-        let hash_set: HashSet<_> = spellings.iter().map(|v| version(v)).collect();
-        assert_eq!(hash_set.len(), 4);
-        let tree_set: BTreeSet<_> = spellings.iter().map(|v| version(v)).collect();
-        assert_eq!(tree_set.len(), 4);
-    }
-
-    #[test]
-    fn ordering_breaks_precedence_ties_by_spelling() {
-        let mut versions: Vec<_> = ["1.0", "0.9", "1", "1.0-rc.1", "1.0+build.7"]
-            .iter()
-            .map(|v| version(v))
-            .collect();
-        versions.sort();
-        let sorted: Vec<_> = versions.iter().map(ToString::to_string).collect();
+        let spellings = ["1.0+build.7", "1.0", "1", "1.0-rc.1", "0.9", "1.0+build.7"];
+        let hashed: HashSet<Version> = spellings.into_iter().map(version).collect();
+        assert_eq!(hashed.len(), 5);
+        let sorted: BTreeSet<Version> = spellings.into_iter().map(version).collect();
+        let sorted: Vec<String> = sorted.iter().map(ToString::to_string).collect();
         assert_eq!(sorted, ["0.9", "1.0-rc.1", "1", "1.0", "1.0+build.7"]);
     }
 
+    /// Requirements parse with whitespace and display in normalized form.
     #[test]
-    fn supports_calendar_versions() {
-        assert!(version("2024.6.25") > version("2024.6.1"));
-        assert!(version("2024.10") > version("2024.9"));
-        assert!(version("24.10") > version("24.4"));
-
-        let requirement = req(">=2024.6,<2025");
-        assert!(requirement.matches(&version("2024.6.25")));
-        assert!(requirement.matches(&version("2024.12")));
-        assert!(!requirement.matches(&version("2023.12.31")));
-        assert!(!requirement.matches(&version("2025.1")));
-    }
-
-    #[test]
-    fn supports_calendar_versions_with_prereleases() {
-        assert!(version("2024.6.25-rc.1") < version("2024.6.25"));
-        assert!(version("2024.6.25-beta") < version("2024.6.25-rc.1"));
-        assert!(version("24.4-preview.2") < version("24.4"));
-    }
-
-    #[test]
-    fn supports_variable_length_numeric_schemes() {
-        assert!(version("42") < version("43"));
-        assert!(version("2024.6.25.2") > version("2024.6.25.1"));
-        assert!(version("2024.6.25.1") > version("2024.6.25"));
-
-        let requirement = req(">=2024.6.25,<2024.7");
-        assert!(requirement.matches(&version("2024.6.25.3")));
-        assert!(!requirement.matches(&version("2024.7")));
-    }
-
-    #[test]
-    fn supports_compact_timestamp_versions() {
-        assert!(version("20260625071935") > version("20260625071934"));
-        assert!(version("20260625080000") > version("20260625071935"));
-
-        let requirement = req(">=20260625000000,<20260626000000");
-        assert!(requirement.matches(&version("20260625071935")));
-        assert!(!requirement.matches(&version("20260626000000")));
-    }
-
-    #[test]
-    fn parses_and_evaluates_requirements() {
-        let requirement = req(">=5,<6");
-        assert!(requirement.matches(&version("5")));
-        assert!(requirement.matches(&version("5.2.3")));
-        assert!(!requirement.matches(&version("4.9.9")));
-        assert!(!requirement.matches(&version("6")));
-    }
-
-    #[test]
-    fn bare_requirement_is_exact_match() {
-        let requirement = req("5.0");
-        assert!(requirement.matches(&version("5")));
-        assert!(!requirement.matches(&version("5.0.1")));
-    }
-
-    #[test]
-    fn any_requirement_matches_everything() {
-        let requirement = req("*");
-        assert!(requirement.is_any());
-        assert!(requirement.matches(&version("0.1")));
-        assert!(requirement.matches(&version("999.999")));
-    }
-
-    #[test]
-    fn range_matches_whole_line_including_prereleases() {
-        let requirement = req(">=3,<4");
-        assert!(requirement.matches(&version("3.0-rc.1")));
-        assert!(requirement.matches(&version("3.5-beta")));
-        assert!(requirement.matches(&version("3.9")));
-        assert!(!requirement.matches(&version("4.0-rc.1")));
-        assert!(!requirement.matches(&version("4-0")));
-        assert!(!requirement.matches(&version("2.9")));
-    }
-
-    #[test]
-    fn lower_and_exclusive_upper_bounds_ignore_precision() {
-        for bound in ["3", "3.0", "3.0.0"] {
-            assert!(req(&format!(">={bound}")).matches(&version("3-rc.1")));
-            assert!(req(&format!(">={bound}")).matches(&version("3.0.0-rc.1")));
-            assert!(!req(&format!("<{bound}")).matches(&version("3.0-rc.1")));
-            assert!(req(&format!("<{bound}")).matches(&version("2.9")));
-        }
-    }
-
-    #[test]
-    fn greater_bound_starts_after_its_line() {
-        assert!(!req(">3").matches(&version("3.1")));
-        assert!(!req(">3").matches(&version("3")));
-        assert!(req(">3").matches(&version("4.0-rc.1")));
-        assert!(req(">3.0").matches(&version("3.1")));
-        assert!(!req(">3.0").matches(&version("3.0.5")));
-        assert!(req(">3.0.0").matches(&version("3.0.5")));
-        assert!(!req(">3.0").matches(&version("3")));
-    }
-
-    #[test]
-    fn inclusive_upper_bound_ends_with_its_line() {
-        assert!(req("<=3").matches(&version("3.9")));
-        assert!(req("<=3").matches(&version("3.0-rc.1")));
-        assert!(!req("<=3").matches(&version("4.0-rc.1")));
-        assert!(req("<=3.0").matches(&version("3.0.5")));
-        assert!(!req("<=3.0").matches(&version("3.1")));
-    }
-
-    #[test]
-    fn exact_comparators_ignore_lines() {
-        assert!(req("==3").matches(&version("3.0")));
-        assert!(!req("==3").matches(&version("3.0-rc.1")));
-        assert!(!req("==3").matches(&version("3.0.1")));
-        assert!(req("!=3").matches(&version("3.0.1")));
-        assert!(!req("!=3").matches(&version("3.0.0")));
-    }
-
-    #[test]
-    fn prerelease_bounds_keep_total_order() {
-        assert!(req("<4-rc.2").matches(&version("4-rc.1")));
-        assert!(!req("<4-rc.2").matches(&version("4-rc.2")));
-        assert!(req("<1-alpha.1").matches(&version("1-alpha")));
-        assert!(!req(">=3-rc.2").matches(&version("3-rc.1")));
-        assert!(req(">=3-rc.2").matches(&version("3-rc.2")));
-        assert!(req(">3-rc.1").matches(&version("3-rc.2")));
-        assert!(!req("<=4-rc.1").matches(&version("4-rc.2")));
-    }
-
-    #[test]
-    fn wildcard_matches_line() {
-        let requirement = req("3.*");
-        assert!(requirement.matches(&version("3.0-rc.1")));
-        assert!(requirement.matches(&version("3")));
-        assert!(requirement.matches(&version("3.5.1")));
-        assert!(!requirement.matches(&version("4.0-rc.1")));
-        assert!(!requirement.matches(&version("2.9")));
-        assert!(req("==2024.6.*").matches(&version("2024.6.30")));
-        assert!(!req("2024.6.*").matches(&version("2024.7.1")));
-        assert!(req("3.0.*").matches(&version("3")));
-        assert!(!req("3.0.*").matches(&version("3.1")));
-        assert!(!req("!=3.*").matches(&version("3.2")));
-        assert!(req("!=3.*").matches(&version("4.0")));
-        assert!(req("3.*,>=3.2").matches(&version("3.2-rc.1")));
-        assert!(!req("3.*,>=3.2").matches(&version("3.1")));
-    }
-
-    #[test]
-    fn wildcard_round_trips_through_display() {
-        assert_eq!(req("3.*").to_string(), "==3.*");
-        assert_eq!(req("!=2024.6.*").to_string(), "!=2024.6.*");
-        assert_eq!(req(">=3,<4").to_string(), ">=3,<4");
-    }
-
-    #[test]
-    fn not_equal_requirement_excludes_matching_versions() {
-        let requirement = req(">=5,!=5.1,<6");
-        assert!(requirement.matches(&version("5.0")));
-        assert!(!requirement.matches(&version("5.1.0")));
-        assert!(requirement.matches(&version("5.2")));
-    }
-
-    #[test]
-    fn rejects_invalid_versions() {
-        for input in [
-            "",
-            ".",
-            "1..2",
-            "1.x",
-            "1-",
-            "1.0-alpha..1",
-            "1.0-alpha_1",
-            "1.0+",
-            "1.0+build..1",
-            "1.0+build+1",
+    fn normalizes_requirements() {
+        for (input, display) in [
+            (">=2.20,<3", ">=2.20,<3"),
+            (" >= 2.20 , < 3 ", ">=2.20,<3"),
+            ("= 5", "==5"),
+            ("5", "==5"),
+            ("3.*", "==3.*"),
+            ("!=2026.6.*", "!=2026.6.*"),
+            ("*", "*"),
+            (" * ", "*"),
         ] {
-            assert!(Version::parse(input).is_err(), "{input:?} should fail");
+            assert_eq!(req(input).to_string(), display, "{input:?}");
         }
+        assert!(req("*").is_any());
+        assert!(!req(">=0").is_any());
     }
 
+    /// Requirement parsing reports the part that failed.
     #[test]
     fn rejects_invalid_requirements() {
-        for input in [
-            "",
-            ">=",
-            ">=1,",
-            ">=1,,<2",
-            ">=3.*",
-            "<3.*",
-            "3.*-rc.1",
-            "3-rc.1.*",
-            "3.*+build",
-            "3.*.*",
-            ".*",
+        for (input, failing, message) in [
+            ("", "", "requirement must not be empty"),
+            (">=1,", ">=1,", "comparators must not be empty"),
+            (">=1,,<2", ">=1,,<2", "comparators must not be empty"),
+            (">=", ">=", "comparator is missing a version"),
+            ("*,<2", "*", "release components must be numeric"),
+            ("^1.2", "^1.2", "release components must be numeric"),
+            ("~1", "~1", "release components must be numeric"),
+            (">=3,==x", "x", "release components must be numeric"),
+            (
+                ">=3.*",
+                ">=3.*",
+                "wildcards are only allowed with `==` and `!=`",
+            ),
+            (
+                "<3.*",
+                "<3.*",
+                "wildcards are only allowed with `==` and `!=`",
+            ),
+            (
+                "3-rc.1.*",
+                "3-rc.1.*",
+                "wildcard versions must not have a prerelease or build metadata",
+            ),
+            (
+                "3+b.*",
+                "3+b.*",
+                "wildcard versions must not have a prerelease or build metadata",
+            ),
+            ("3.*.*", "3.*", "release components must be numeric"),
+            (".*", "", "version must not be empty"),
         ] {
-            assert!(VersionReq::parse(input).is_err(), "{input:?} should fail");
+            let error = VersionReq::parse(input).err();
+            assert_eq!(
+                error.as_ref().map(|e| (e.input(), e.message())),
+                Some((failing, message)),
+                "{input:?}"
+            );
         }
     }
 
-    mod properties {
-        use std::cmp::Ordering;
+    /// Every row of the comparator table in the crate documentation holds.
+    #[test]
+    fn matches_the_documented_comparator_table() {
+        assert_matches(&[
+            (">=3", "3.0-rc.1", true),
+            (">=3", "3.9", true),
+            (">=3", "2.9", false),
+            ("<4", "3.9", true),
+            ("<4", "4.0-rc.1", false),
+            (">3", "4.0-rc.1", true),
+            (">3", "3.1", false),
+            ("<=3", "3.9", true),
+            ("<=3", "4.0-rc.1", false),
+            ("3.*", "3.0-rc.1", true),
+            ("3.*", "3.5.1", true),
+            ("3.*", "4.0-rc.1", false),
+            ("!=3.*", "4.0", true),
+            ("!=3.*", "3.2", false),
+            ("==3", "3.0", true),
+            ("==3", "3+build.7", true),
+            ("==3", "3.0-rc.1", false),
+            ("==3", "3.0.1", false),
+            ("!=3", "3.0.1", true),
+            ("!=3", "3.0", false),
+        ]);
+    }
 
-        use proptest::prelude::*;
+    /// A range matches its whole line, including prereleases, but not the next line.
+    #[test]
+    fn matches_lines_including_prereleases() {
+        assert_matches(&[
+            (">=3,<4", "3.0-rc.1", true),
+            (">=3,<4", "3.5-beta", true),
+            (">=3,<4", "3.9.2", true),
+            (">=3,<4", "4.0-rc.1", false),
+            (">=3,<4", "4-0", false),
+            (">=3,<4", "2.9", false),
+            (">=2.20,<3", "2.27.0", true),
+            (">=2.20,<3", "2.20.0-rc.1", true),
+            (">=2.20,<3", "2.19.9", false),
+        ]);
+    }
 
-        use super::{req, version};
-
-        /// A release component or numeric identifier, sometimes with leading zeros.
-        fn number(max: u64) -> impl Strategy<Value = String> {
-            prop_oneof![
-                (0..max).prop_map(|n| n.to_string()),
-                (0..max).prop_map(|n| format!("0{n}")),
-            ]
+    /// Appending zeros narrows the end of a line, but not its start.
+    #[test]
+    fn respects_the_precision_of_line_ends() {
+        assert_matches(&[
+            (">3", "3.1", false),
+            (">3.0", "3.1", true),
+            (">3.0", "3.0.5", false),
+            (">3.0.0", "3.0.5", true),
+            (">3.0", "3", false),
+            ("<=3", "3.0.5", true),
+            ("<=3.0", "3.0.5", true),
+            ("<=3.0", "3.1", false),
+            (">1.2.3", "1.2.3.4", false),
+            ("<=1.2.3", "1.2.3.4", true),
+        ]);
+        for bound in ["3", "3.0", "3.0.0"] {
+            assert_matches(&[
+                (&format!(">={bound}"), "3-rc.1", true),
+                (&format!(">={bound}"), "3.0.0-rc.1", true),
+                (&format!("<{bound}"), "3.0-rc.1", false),
+                (&format!("<{bound}"), "2.9", true),
+            ]);
         }
+    }
 
-        /// A prerelease or build identifier, numeric or alphanumeric.
-        fn identifier() -> impl Strategy<Value = String> {
-            prop_oneof![number(12), "[0-9A-Za-z-]{0,2}[A-Za-z-][0-9A-Za-z-]{0,2}",]
+    /// Comparators whose version has a prerelease compare by precedence.
+    #[test]
+    fn compares_prerelease_bounds_by_precedence() {
+        assert_matches(&[
+            (">=3-rc.2", "3-rc.1", false),
+            (">=3-rc.2", "3-rc.2", true),
+            (">=3-rc.2", "3", true),
+            (">=3-rc.2", "4", true),
+            (">3-rc.1", "3-rc.2", true),
+            ("<4-rc.2", "4-rc.1", true),
+            ("<4-rc.2", "4-rc.2", false),
+            ("<4-rc.2", "4", false),
+            ("<=4-rc.1", "4-rc.2", false),
+            ("==1.0-rc.1", "1-rc.01", true),
+            ("!=1.0-rc.1", "1.0-rc.2", true),
+        ]);
+    }
+
+    /// Wildcards match a line of any precision and combine with other comparators.
+    #[test]
+    fn matches_wildcards() {
+        assert_matches(&[
+            ("3.*", "3", true),
+            ("3.*", "2.9", false),
+            ("3.0.*", "3", true),
+            ("3.0.*", "3.0.9-rc.1", true),
+            ("3.0.*", "3.1", false),
+            ("2026.6.*", "2026.06.30", true),
+            ("2026.6.*", "2026.7.1", false),
+            ("3.*,>=3.2", "3.2-rc.1", true),
+            ("3.*,>=3.2", "3.1", false),
+            (">=5,!=5.1,<6", "5.0", true),
+            (">=5,!=5.1,<6", "5.1.0", false),
+            (">=5,!=5.1,<6", "5.2", true),
+        ]);
+    }
+
+    /// Requirements work the same for calendar versions, serials, and timestamps.
+    #[test]
+    fn matches_other_schemes() {
+        assert_matches(&[
+            (">=2024.6,<2025", "2024.6.25", true),
+            (">=2024.6,<2025", "2024.12", true),
+            (">=2024.6,<2025", "2023.12.31", false),
+            (">=2024.6,<2025", "2025.1-rc.1", false),
+            (">=2024.6.25,<2024.7", "2024.6.25.3", true),
+            (">=42", "43", true),
+            (">=20260625000000,<20260626000000", "20260625071935", true),
+            (">=20260625000000,<20260626000000", "20260626000000", false),
+        ]);
+    }
+
+    /// `*` matches every version, including prereleases.
+    #[test]
+    fn any_matches_everything() {
+        for input in ["0", "0.1-alpha", "999.999+b"] {
+            assert!(VersionReq::any().matches(&version(input)), "{input}");
         }
+    }
 
-        /// Release components, kept small so that versions often share lines.
-        fn release() -> impl Strategy<Value = String> {
-            prop::collection::vec(number(3), 1..4).prop_map(|parts| parts.join("."))
+    /// Comparators built directly behave like parsed ones.
+    #[test]
+    fn builds_comparators_directly() {
+        let at_least_3 = Comparator::new(Operator::GreaterEq, version("3"));
+        assert_eq!(at_least_3, "  >= 3".parse().expect("comparator must parse"));
+        assert_eq!(at_least_3.op(), Operator::GreaterEq);
+        assert_eq!(at_least_3.version(), &version("3"));
+        assert!(!at_least_3.is_wildcard());
+
+        let line = Comparator::wildcard(Operator::NotEqual, version("3"));
+        assert_eq!(line, "!=3.*".parse().ok());
+        assert!(Comparator::wildcard(Operator::Equal, version("3")).is_some());
+        for (op, input) in [
+            (Operator::Greater, "3"),
+            (Operator::LessEq, "3"),
+            (Operator::Equal, "3-rc.1"),
+            (Operator::Equal, "3+b"),
+        ] {
+            assert!(
+                Comparator::wildcard(op, version(input)).is_none(),
+                "{op}{input}.*"
+            );
         }
+    }
 
-        /// Dot-separated identifiers.
-        fn identifiers() -> impl Strategy<Value = String> {
-            prop::collection::vec(identifier(), 1..4).prop_map(|parts| parts.join("."))
+    /// Requirements can be collected from comparators.
+    #[test]
+    fn builds_requirements_from_comparators() {
+        let requirement: VersionReq = [
+            Comparator::new(Operator::GreaterEq, version("2.20")),
+            Comparator::new(Operator::Less, version("3")),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(requirement, req(">=2.20,<3"));
+        assert_eq!(VersionReq::from_iter([]), VersionReq::any());
+        let single = VersionReq::from(Comparator::new(Operator::Equal, version("5")));
+        assert_eq!(single, req("5"));
+    }
+
+    /// Operators parse with surrounding whitespace and display canonically.
+    #[test]
+    fn parses_and_displays_operators() {
+        for (input, op, display) in [
+            ("==", Operator::Equal, "=="),
+            (" = ", Operator::Equal, "=="),
+            ("!=", Operator::NotEqual, "!="),
+            (">", Operator::Greater, ">"),
+            (">=", Operator::GreaterEq, ">="),
+            ("<", Operator::Less, "<"),
+            ("<=", Operator::LessEq, "<="),
+        ] {
+            assert_eq!(input.parse(), Ok(op), "{input:?}");
+            assert_eq!(op.to_string(), display);
         }
+        let error = " => ".parse::<Operator>().err();
+        assert_eq!(
+            error.as_ref().map(|e| (e.input(), e.message())),
+            Some(("=>", "unknown operator"))
+        );
+    }
 
-        /// A version spelled with all parts of the grammar.
-        fn version_text() -> impl Strategy<Value = String> {
-            (
-                release(),
-                prop::option::of(identifiers()),
-                prop::option::of(identifiers()),
-            )
-                .prop_map(|(release, prerelease, build)| {
-                    let mut text = release;
-                    if let Some(prerelease) = prerelease {
-                        text = format!("{text}-{prerelease}");
-                    }
-                    if let Some(build) = build {
-                        text = format!("{text}+{build}");
-                    }
-                    text
-                })
-        }
+    /// Parse errors display their input and message.
+    #[test]
+    fn displays_parse_errors() {
+        let error = Version::parse("1.x").err().map(|e| e.to_string());
+        assert_eq!(
+            error.as_deref(),
+            Some(r#"error parsing "1.x": release components must be numeric"#)
+        );
+    }
 
-        /// A version that certainly has a prerelease.
-        fn prerelease_text() -> impl Strategy<Value = String> {
-            (release(), identifiers()).prop_map(|(release, pre)| format!("{release}-{pre}"))
-        }
+    /// Serialization uses the display form, and deserialization validates it.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serializes_as_strings() {
+        let requirement = serde_json::to_string(&req(" >= 3 , 3.* ")).ok();
+        assert_eq!(requirement.as_deref(), Some(r#"">=3,==3.*""#));
+        let parsed: Option<Version> = serde_json::from_str(r#""1.0-rc.1""#).ok();
+        assert_eq!(parsed, Some(version("1.0-rc.1")));
+        let operator: Option<Operator> = serde_json::from_str(r#""<=""#).ok();
+        assert_eq!(operator, Some(Operator::LessEq));
+        assert!(serde_json::from_str::<Version>(r#""1..2""#).is_err());
+        assert!(serde_json::from_str::<VersionReq>(r#""^1""#).is_err());
+    }
 
-        proptest! {
-            /// Every version displays as it was spelled and parses back to itself.
-            #[test]
-            fn display_round_trips(text in version_text()) {
-                let parsed = version(&text);
-                prop_assert_eq!(parsed.to_string(), text);
-                prop_assert_eq!(version(&parsed.to_string()), parsed);
-            }
-
-            /// Parsing arbitrary input fails gracefully instead of panicking.
-            #[test]
-            fn parsing_arbitrary_input_does_not_panic(text in "\\PC{0,24}") {
-                let _ = super::Version::parse(&text);
-                let _ = super::VersionReq::parse(&text);
-            }
-
-            /// `Ord` is a total order consistent with `Eq` that refines precedence.
-            #[test]
-            fn ordering_is_consistent(
-                a in version_text(),
-                b in version_text(),
-                c in version_text(),
-            ) {
-                let (a, b, c) = (version(&a), version(&b), version(&c));
-                prop_assert_eq!(a.cmp(&b) == Ordering::Equal, a == b);
-                prop_assert_eq!(a.cmp(&b), b.cmp(&a).reverse());
-                if a <= b && b <= c {
-                    prop_assert!(a <= c);
-                }
-                let precedence = a.cmp_precedence(&b);
-                prop_assert_eq!(precedence, b.cmp_precedence(&a).reverse());
-                if precedence.is_ne() {
-                    prop_assert_eq!(a.cmp(&b), precedence);
-                }
-            }
-
-            /// Comparators on a line are complements and compose into the wildcard.
-            #[test]
-            fn line_comparators_are_consistent(bound in release(), candidate in version_text()) {
-                let candidate = version(&candidate);
-                let matches = |requirement: String| req(&requirement).matches(&candidate);
-                prop_assert_eq!(matches(format!(">={bound}")), !matches(format!("<{bound}")));
-                prop_assert_eq!(matches(format!(">{bound}")), !matches(format!("<={bound}")));
-                prop_assert_eq!(matches(format!("=={bound}")), !matches(format!("!={bound}")));
-                prop_assert_eq!(matches(format!("{bound}.*")), !matches(format!("!={bound}.*")));
-                prop_assert_eq!(
-                    matches(format!("{bound}.*")),
-                    matches(format!(">={bound}")) && matches(format!("<={bound}")),
-                );
-                let (greater, greater_eq) = (matches(format!(">{bound}")), matches(format!(">={bound}")));
-                let (less, less_eq) = (matches(format!("<{bound}")), matches(format!("<={bound}")));
-                prop_assert!(!greater || greater_eq);
-                prop_assert!(!less || less_eq);
-            }
-
-            /// Comparators whose version has a prerelease follow precedence.
-            #[test]
-            fn prerelease_comparators_follow_precedence(
-                bound in prerelease_text(),
-                candidate in version_text(),
-            ) {
-                let precedence = version(&candidate).cmp_precedence(&version(&bound));
-                let matches = |op: &str| req(&format!("{op}{bound}")).matches(&version(&candidate));
-                prop_assert_eq!(matches("=="), precedence.is_eq());
-                prop_assert_eq!(matches("!="), precedence.is_ne());
-                prop_assert_eq!(matches(">"), precedence.is_gt());
-                prop_assert_eq!(matches(">="), precedence.is_ge());
-                prop_assert_eq!(matches("<"), precedence.is_lt());
-                prop_assert_eq!(matches("<="), precedence.is_le());
-            }
+    /// Assert whether each requirement matches each version.
+    fn assert_matches(cases: &[(&str, &str, bool)]) {
+        for &(requirement, candidate, expected) in cases {
+            let actual = req(requirement).matches(&version(candidate));
+            assert_eq!(actual, expected, "{requirement} against {candidate}");
         }
     }
 

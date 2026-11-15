@@ -15,7 +15,6 @@ categories = ["parser-implementations"]
 serde = { version = "1.0.228", optional = true, features = ["derive"] }
 
 [dev-dependencies]
-proptest.workspace = true
 serde_json.workspace = true
 
 [features]

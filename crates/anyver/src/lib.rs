@@ -8,12 +8,17 @@
 //! - an optional prerelease suffix introduced by `-`, e.g. `5.2.0-rc.1`;
 //! - optional build metadata introduced by `+`, e.g. `5.2.0+build.7`.
 //!
-//! Release components are compared numerically with trailing zero components
-//! ignored, so `5`, `5.0`, and `5.0.0` are equal. Prerelease versions sort
-//! before the corresponding final release. Numeric release and prerelease
-//! identifiers may contain leading zeroes and are normalized for comparison.
-//! The parsed spelling is preserved for display. Build metadata is preserved
-//! but ignored for equality, hashing, ordering, and requirement matching.
+//! Versions are ordered by _precedence_. Release components compare numerically
+//! with trailing zero components ignored, so `5`, `5.0`, and `5.0.0` have the
+//! same precedence. Prerelease versions precede the corresponding final release.
+//! Numeric release and prerelease identifiers may contain leading zeroes, which
+//! do not affect precedence. Build metadata does not affect precedence either.
+//! Requirement matching uses precedence, so `==5` matches `5.0` and `5+build.7`.
+//!
+//! [`Version`] values keep their exact spelling. Equality and hashing compare
+//! the spelling, so `5`, `5.0`, and `5+build.7` are different values. [`Ord`]
+//! orders by precedence and breaks ties by spelling, so it is consistent with
+//! equality.
 //!
 //! A [`VersionReq`] is a comma-separated conjunction of [`Comparator`]s. A
 //! comparator's version without a prerelease names a _line_: all versions whose
@@ -78,8 +83,7 @@ impl Version {
 
     /// Numeric release components as parsed.
     ///
-    /// Trailing zero components are preserved here but ignored for equality,
-    /// hashing, ordering, and requirement matching.
+    /// Trailing zero components are preserved here but do not affect precedence.
     #[must_use]
     pub fn release(&self) -> &[u64] {
         &self.release
@@ -93,8 +97,7 @@ impl Version {
 
     /// Build metadata identifiers.
     ///
-    /// Build metadata is preserved but ignored for equality, hashing, ordering,
-    /// and requirement matching.
+    /// Build metadata does not affect precedence or requirement matching.
     #[must_use]
     pub fn build_metadata(&self) -> &[String] {
         &self.build_metadata
@@ -181,25 +184,9 @@ impl FromStr for Version {
     }
 }
 
-impl PartialEq for Version {
-    fn eq(&self, other: &Self) -> bool {
-        compare_release(&self.release, &other.release) == Ordering::Equal
-            && self.prerelease == other.prerelease
-    }
-}
-
-impl Eq for Version {}
-
-impl Hash for Version {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        let release_len = semantic_release_len(&self.release);
-        self.release[..release_len].hash(state);
-        self.prerelease.hash(state);
-    }
-}
-
-impl Ord for Version {
-    fn cmp(&self, other: &Self) -> Ordering {
+impl Version {
+    /// Compare by precedence, ignoring spelling and build metadata.
+    fn precedence(&self, other: &Self) -> Ordering {
         match compare_release(&self.release, &other.release) {
             Ordering::Equal => {}
             non_equal => return non_equal,
@@ -211,6 +198,27 @@ impl Ord for Version {
             (false, true) => Ordering::Less,
             (false, false) => self.prerelease.cmp(&other.prerelease),
         }
+    }
+}
+
+impl PartialEq for Version {
+    fn eq(&self, other: &Self) -> bool {
+        self.display == other.display
+    }
+}
+
+impl Eq for Version {}
+
+impl Hash for Version {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.display.hash(state);
+    }
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.precedence(other)
+            .then_with(|| self.display.cmp(&other.display))
     }
 }
 
@@ -386,17 +394,17 @@ impl Comparator {
         }
         if self.version.is_prerelease() {
             return match self.op {
-                Operator::Equal => version == &self.version,
-                Operator::NotEqual => version != &self.version,
-                Operator::Greater => version > &self.version,
-                Operator::GreaterEq => version >= &self.version,
-                Operator::Less => version < &self.version,
-                Operator::LessEq => version <= &self.version,
+                Operator::Equal => version.precedence(&self.version).is_eq(),
+                Operator::NotEqual => version.precedence(&self.version).is_ne(),
+                Operator::Greater => version.precedence(&self.version).is_gt(),
+                Operator::GreaterEq => version.precedence(&self.version).is_ge(),
+                Operator::Less => version.precedence(&self.version).is_lt(),
+                Operator::LessEq => version.precedence(&self.version).is_le(),
             };
         }
         match self.op {
-            Operator::Equal => version == &self.version,
-            Operator::NotEqual => version != &self.version,
+            Operator::Equal => version.precedence(&self.version).is_eq(),
+            Operator::NotEqual => version.precedence(&self.version).is_ne(),
             Operator::GreaterEq => self.compare_start(version) != Ordering::Less,
             Operator::Less => self.compare_start(version) == Ordering::Less,
             Operator::Greater => self.compare_line(version) == Ordering::Greater,
@@ -713,14 +721,6 @@ fn compare_release(left: &[u64], right: &[u64]) -> Ordering {
     Ordering::Equal
 }
 
-fn semantic_release_len(release: &[u64]) -> usize {
-    let mut len = release.len();
-    while len > 1 && release[len - 1] == 0 {
-        len -= 1;
-    }
-    len
-}
-
 fn parse_build_metadata(input: &str, build_metadata_part: &str) -> Result<Vec<String>, ParseError> {
     if build_metadata_part.is_empty() {
         return Ok(Vec::new());
@@ -753,10 +753,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_trailing_release_zeroes() {
-        assert_eq!(version("5"), version("5.0"));
-        assert_eq!(version("5.0"), version("5.0.0"));
-        assert_eq!(version("05.002.000"), version("5.2"));
+    fn trailing_release_zeroes_do_not_affect_precedence() {
+        assert!(version("5").precedence(&version("5.0")).is_eq());
+        assert!(version("5.0").precedence(&version("5.0.0")).is_eq());
+        assert!(version("05.002.000").precedence(&version("5.2")).is_eq());
+        assert!(req("==5").matches(&version("5.0.0")));
         assert_eq!(version("5.0.0").to_string(), "5.0.0");
         assert_eq!(version("2026.05.12").to_string(), "2026.05.12");
     }
@@ -784,9 +785,14 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_numeric_prerelease_leading_zeroes_for_comparison() {
-        assert_eq!(version("1.0-01"), version("1.0-1"));
-        assert_eq!(version("1.0-alpha.01"), version("1.0-alpha.1"));
+    fn numeric_prerelease_leading_zeroes_do_not_affect_precedence() {
+        assert!(version("1.0-01").precedence(&version("1.0-1")).is_eq());
+        assert!(
+            version("1.0-alpha.01")
+                .precedence(&version("1.0-alpha.1"))
+                .is_eq()
+        );
+        assert!(req("==1.0-1").matches(&version("1.0-01")));
         assert_eq!(version("1.0-01").to_string(), "1.0-01");
         assert_eq!(version("1.0-alpha.01").to_string(), "1.0-alpha.01");
     }
@@ -794,8 +800,8 @@ mod tests {
     #[test]
     fn supports_build_metadata_ignored_for_compatibility() {
         let build = version("1.0+build.7");
-        assert_eq!(build, version("1.0"));
-        assert_eq!(build, version("1.0+build.8"));
+        assert!(build.precedence(&version("1.0")).is_eq());
+        assert!(build.precedence(&version("1.0+build.8")).is_eq());
         assert_eq!(build.to_string(), "1.0+build.7");
         assert_eq!(
             build
@@ -812,24 +818,30 @@ mod tests {
     }
 
     #[test]
-    fn build_metadata_is_ignored_consistently_by_identity_and_ordering() {
-        use std::cmp::Ordering;
+    fn equality_and_hashing_use_spelling() {
         use std::collections::{BTreeSet, HashSet};
 
-        assert_eq!(
-            version("1.0+build.7").cmp(&version("1.0+build.8")),
-            Ordering::Equal
-        );
+        assert_eq!(version("5.0"), version(" 5.0 "));
+        assert_ne!(version("5"), version("5.0"));
+        assert_ne!(version("05"), version("5"));
+        assert_ne!(version("1.0+build.7"), version("1.0+build.8"));
 
-        let mut hash_set = HashSet::new();
-        hash_set.insert(version("1.0+build.7"));
-        hash_set.insert(version("1.0+build.8"));
-        assert_eq!(hash_set.len(), 1);
+        let spellings = ["1.0+build.7", "1.0+build.8", "1.0", "1", "1.0+build.7"];
+        let hash_set: HashSet<_> = spellings.iter().map(|v| version(v)).collect();
+        assert_eq!(hash_set.len(), 4);
+        let tree_set: BTreeSet<_> = spellings.iter().map(|v| version(v)).collect();
+        assert_eq!(tree_set.len(), 4);
+    }
 
-        let mut tree_set = BTreeSet::new();
-        tree_set.insert(version("1.0+build.7"));
-        tree_set.insert(version("1.0+build.8"));
-        assert_eq!(tree_set.len(), 1);
+    #[test]
+    fn ordering_breaks_precedence_ties_by_spelling() {
+        let mut versions: Vec<_> = ["1.0", "0.9", "1", "1.0-rc.1", "1.0+build.7"]
+            .iter()
+            .map(|v| version(v))
+            .collect();
+        versions.sort();
+        let sorted: Vec<_> = versions.iter().map(ToString::to_string).collect();
+        assert_eq!(sorted, ["0.9", "1.0-rc.1", "1", "1.0", "1.0+build.7"]);
     }
 
     #[test]
